@@ -68,6 +68,7 @@ import velox.api.layer1.messages.indicators.WidgetDisplayInfo;
 import velox.api.layer1.settings.StrategySettingsVersion;
 import velox.api.layer1.simplified.Api;
 import velox.api.layer1.simplified.AxisGroup;
+import velox.api.layer1.simplified.BackfilledDataListener;
 import velox.api.layer1.simplified.CustomModule;
 import velox.api.layer1.simplified.CustomSettingsPanelProvider;
 import velox.api.layer1.simplified.HistoricalModeListener;
@@ -82,15 +83,17 @@ import velox.gui.StrategyPanel;
 import velox.gui.colors.ColorsConfigItem;
 
 /**
- * Régime de marché intraday sous un graphique NQ/MNQ, connecté à TWS API en streaming :
+ * Régime de marché intraday sous le graphique de l'instrument affiché dans Bookmap, connecté à TWS
+ * API en streaming. La référence du régime est l'instrument du graphique lui-même (NQ, MNQ, ES,
+ * une action...) : sa performance depuis 09h30 NY est mesurée sur ses propres trades Bookmap.
  *
  * <ul>
  *   <li>Sur la Heatmap ({@link GraphType#PRIMARY}) : courbes continues depuis l'ouverture RTH
- *       (09h30 New York) de l'indice NDX, du panier Risk (9 actions), du panier Refuge (7 actions)
- *       et du panier Mega-cap (5 actions pondérées), projetées sur l'échelle de prix NQ/MNQ.
+ *       (09h30 New York) du panier Risk (9 actions), du panier Refuge (7 actions) et du panier
+ *       Mega-cap (5 actions pondérées), ancrées sur le prix 09h30 de l'instrument du graphique.
  *   <li>Dans le Bottom Chart et le panneau des Widgets ({@link GraphType#BOTTOM}) : Market Regime
  *       (de -2 à +2, coloré dynamiquement selon le régime actif), écart Refuge − Risk (%),
- *       variations directes en % (NDX, Risk, Refuge, Mega-cap) et corrélations Cross / Within.
+ *       variations directes en % (Chart, Risk, Refuge, Mega-cap) et corrélations Cross / Within.
  * </ul>
  */
 @Layer1SimpleAttachable
@@ -103,6 +106,8 @@ public class MarketRegime
         TimeListener,
         IntervalListener,
         HistoricalModeListener,
+        // Reçoit aussi l'historique cloud (backfill) de l'instrument pour connaître son vrai 09h30
+        BackfilledDataListener,
         CustomSettingsPanelProvider {
 
   private static final ZoneId NY_ZONE = ZoneId.of("America/New_York");
@@ -114,8 +119,6 @@ public class MarketRegime
   private static final int STOCK_COUNT = RISK_COUNT + REFUGE_COUNT;
   private static final int MEGA_COUNT = 5;
   private static final int STOCK_SLOTS = STOCK_COUNT + MEGA_COUNT;
-  private static final int SLOT_NDX = STOCK_SLOTS;
-  private static final int TOTAL_SLOTS = STOCK_SLOTS + 1;
   private static final int MIN_BASKET_STOCKS = 5;
   private static final int MIN_MEGA_STOCKS = 3;
   private static final int MIN_CORR_STEPS = 3;
@@ -125,7 +128,14 @@ public class MarketRegime
   private static final double PERF_HYSTERESIS = 0.10;
   private static final double SPREAD_EXIT_RATIO = 0.8;
 
-  private static final int TICKER_NDX = 100;
+  // Courbes Heatmap (index 0..2) et performance de l'instrument (index 3) dans heatmapPerfPoints
+  private static final int HEATMAP_LINES = 3;
+  private static final int PERF_CHART = 3;
+  private static final int MIN_AUTO_SCALE_STEPS = 10;
+  private static final double MIN_HEATMAP_SCALE = 0.05;
+  private static final double MAX_HEATMAP_SCALE = 2.0;
+  private static final double AUTO_SCALE_REDRAW_RATIO = 0.05;
+
   private static final int TICKER_RISK_BASE = 200;
   private static final int TICKER_REF_BASE = 300;
   private static final int TICKER_MEGA_BASE = 400;
@@ -139,7 +149,7 @@ public class MarketRegime
   private static final int FIELD_DELAYED_OPEN = 76;
 
   // Couleurs par défaut alignées sur market regime.pine
-  private static final Color DEFAULT_NDX_COLOR = new Color(0xFF, 0xEB, 0x3B);
+  private static final Color DEFAULT_CHART_COLOR = new Color(0xFF, 0xEB, 0x3B);
   private static final Color DEFAULT_RISK_COLOR = new Color(0x29, 0x62, 0xFF);
   private static final Color DEFAULT_REFUGE_COLOR = new Color(0xFF, 0x98, 0x00);
   private static final Color DEFAULT_MEGA_COLOR = new Color(0x9C, 0x27, 0xB0);
@@ -226,8 +236,14 @@ public class MarketRegime
     /** Facteur d'échelle verticale des courbes sur la Heatmap (ex. 0.25). */
     public double heatmapScale = 0.25;
 
-    /** Couleur de la courbe NDX (Heatmap & Bottom Chart). */
-    public int ndxLineColor = DEFAULT_NDX_COLOR.getRGB();
+    /**
+     * Vrai pour ramener chaque courbe de la Heatmap à l'amplitude de l'instrument du graphique
+     * (l'échelle manuelle ne sert alors qu'au début de séance, faute de données suffisantes).
+     */
+    public boolean heatmapAutoScale = true;
+
+    /** Couleur de la courbe Chart (performance de l'instrument du graphique, Bottom Chart). */
+    public int chartLineColor = DEFAULT_CHART_COLOR.getRGB();
 
     /** Couleur de la courbe Risk sur la Heatmap. */
     public int riskLineColor = DEFAULT_RISK_COLOR.getRGB();
@@ -277,15 +293,15 @@ public class MarketRegime
   private Api api;
   private Settings settings = new Settings();
   private double instrumentPips = 1.0;
+  private String chartAlias = "Chart";
 
   // Indicateurs Heatmap (GraphType.PRIMARY : courbes activées, Widgets désactivés)
-  private IndicatorModifiable ndxHeatmapIndicator;
   private IndicatorModifiable riskHeatmapIndicator;
   private IndicatorModifiable refugeHeatmapIndicator;
   private IndicatorModifiable megaHeatmapIndicator;
 
   // Indicateurs Bottom Chart & Widgets en % (GraphType.BOTTOM : courbes + Widgets activés)
-  private IndicatorModifiable ndxIndicator;
+  private IndicatorModifiable chartIndicator;
   private IndicatorModifiable riskIndicator;
   private IndicatorModifiable refugeIndicator;
   private IndicatorModifiable megaIndicator;
@@ -296,34 +312,38 @@ public class MarketRegime
   private IndicatorModifiable crossIndicator;
   private IndicatorModifiable withinIndicator;
 
-  // État horloge & prix NQ/MNQ dans Bookmap
+  // État horloge & prix de l'instrument du graphique Bookmap (en ticks, comme onTrade)
   private volatile long chartNanos;
   private long lastTimestampSec = Long.MIN_VALUE;
   private volatile boolean isRealtime;
   private volatile LocalDate currentRthDate;
   private volatile boolean inRegularSession;
-  private volatile double nqOpenLevel0930 = Double.NaN;
-  private volatile boolean nqOpen0930Locked;
-  private volatile double lastNqLevel = Double.NaN;
-  private final TreeMap<Long, Double> nqMinuteCloses = new TreeMap<>();
+  private volatile double chartOpen0930 = Double.NaN;
+  private volatile boolean chartOpenLocked;
+  private volatile boolean chartOpenEstimated;
+  private volatile double chartLast = Double.NaN;
+  private final TreeMap<Long, Double> chartMinuteCloses = new TreeMap<>();
 
-  // État des prix reçus de TWS (index 0..8 = Risk, 9..15 = Refuge, Mega, et indice NDX)
-  private double ndxOpen = Double.NaN;
-  private double ndxLast = Double.NaN;
+  // État des prix reçus de TWS (index 0..8 = Risk, 9..15 = Refuge, puis Mega)
   private final double[] stockOpen = new double[STOCK_COUNT];
   private final double[] stockLast = new double[STOCK_COUNT];
   private final double[] megaOpen = new double[MEGA_COUNT];
   private final double[] megaLast = new double[MEGA_COUNT];
 
-  // Historique RTH 1m depuis 09h30 NY (0..8 = Risk, 9..15 = Refuge, 16..20 = Mega, 21 = NDX)
+  // Historique RTH 1m depuis 09h30 NY (0..8 = Risk, 9..15 = Refuge, 16..20 = Mega)
   private LocalDate histSessionDate;
   private final TreeMap<Long, double[]> histMinuteCloses = new TreeMap<>();
-  private final long[] histFirstBarSec = new long[TOTAL_SLOTS];
-  private final long[] histLastBarSec = new long[TOTAL_SLOTS];
-  private final double[] histOpen0930 = new double[TOTAL_SLOTS];
-  private final int[] histBarCount = new int[TOTAL_SLOTS];
-  private final boolean[] histTickerDone = new boolean[TOTAL_SLOTS];
-  private int histCompletedTickers;
+
+  // Performances (%) tracées sur la Heatmap {Risk, Refuge, Mega} par horodatage (ns), historique
+  // 1m et temps réel 1s, pour reprojeter les courbes sans perte quand l'échelle change
+  private final TreeMap<Long, double[]> heatmapPerfPoints = new TreeMap<>();
+  private final double[] autoScales = new double[HEATMAP_LINES];
+  private long lastAutoScaleMinute = Long.MIN_VALUE;
+  private final long[] histFirstBarSec = new long[STOCK_SLOTS];
+  private final long[] histLastBarSec = new long[STOCK_SLOTS];
+  private final double[] histOpen0930 = new double[STOCK_SLOTS];
+  private final int[] histBarCount = new int[STOCK_SLOTS];
+  private final boolean[] histTickerDone = new boolean[STOCK_SLOTS];
   private int histCompletedStocks;
   private volatile String lastTwsError = "None";
 
@@ -346,6 +366,7 @@ public class MarketRegime
   public void initialize(String alias, InstrumentInfo info, Api api, InitialState initialState) {
     this.api = api;
     this.instrumentPips = (info != null && info.pips > 0.0) ? info.pips : 1.0;
+    this.chartAlias = (alias != null && !alias.isBlank()) ? alias : "Chart";
     Settings loaded = api.getSettings(Settings.class);
     if (loaded != null) {
       sanitizeSettings(loaded);
@@ -356,9 +377,6 @@ public class MarketRegime
     WidgetDisplayInfo symmetricZero = new WidgetDisplayInfo(WidgetDisplayInfo.Type.SYMMETRIC, 0.0);
 
     // 1. Courbes sur la Heatmap (GraphType.PRIMARY, sans Widgets pour éviter les prix projetés)
-    ndxHeatmapIndicator =
-        api.registerIndicatorModifiable(
-            "NDX (Heatmap)", GraphType.PRIMARY, Double.NaN, true, false);
     riskHeatmapIndicator =
         api.registerIndicatorModifiable(
             "Risk (Heatmap)", GraphType.PRIMARY, Double.NaN, true, false);
@@ -370,9 +388,9 @@ public class MarketRegime
             "Mega-cap (Heatmap)", GraphType.PRIMARY, Double.NaN, true, false);
 
     // 2. Variations directes en % dans le Bottom Chart et les Widgets (GraphType.BOTTOM)
-    ndxIndicator =
-        api.registerIndicatorModifiable("NDX", GraphType.BOTTOM, Double.NaN, true, true);
-    ndxIndicator.setWidgetRules(new WidgetRules(-2.0, 2.0, symmetricZero));
+    chartIndicator =
+        api.registerIndicatorModifiable("Chart", GraphType.BOTTOM, Double.NaN, true, true);
+    chartIndicator.setWidgetRules(new WidgetRules(-2.0, 2.0, symmetricZero));
 
     riskIndicator =
         api.registerIndicatorModifiable("Risk", GraphType.BOTTOM, Double.NaN, true, true);
@@ -387,7 +405,7 @@ public class MarketRegime
     megaIndicator.setWidgetRules(new WidgetRules(-2.0, 2.0, symmetricZero));
 
     AxisGroup perfAxisGroup = new AxisGroup();
-    perfAxisGroup.add(ndxIndicator);
+    perfAxisGroup.add(chartIndicator);
     perfAxisGroup.add(riskIndicator);
     perfAxisGroup.add(refugeIndicator);
     perfAxisGroup.add(megaIndicator);
@@ -455,14 +473,15 @@ public class MarketRegime
       currentRthDate = nyDate;
       if (dateChanged) {
         synchronized (this) {
-          nqMinuteCloses.clear();
+          chartMinuteCloses.clear();
         }
-        if (nyTime.isBefore(LocalTime.of(9, 31)) && !Double.isNaN(lastNqLevel)) {
-          nqOpenLevel0930 = lastNqLevel;
-          nqOpen0930Locked = true;
+        chartOpenEstimated = false;
+        if (nyTime.isBefore(LocalTime.of(9, 31)) && !Double.isNaN(chartLast)) {
+          chartOpen0930 = chartLast;
+          chartOpenLocked = true;
         } else {
-          nqOpenLevel0930 = Double.NaN;
-          nqOpen0930Locked = false;
+          chartOpen0930 = Double.NaN;
+          chartOpenLocked = false;
         }
       }
       if (isRealtime && histSessionDate != null && !nyDate.equals(histSessionDate)) {
@@ -473,18 +492,18 @@ public class MarketRegime
 
   @Override
   public void onTrade(double price, int size, TradeInfo tradeInfo) {
-    lastNqLevel = price;
+    chartLast = price;
     long ts = chartNanos;
     if (ts > 0) {
       long minuteSec = (ts / 1_000_000_000L / 60L) * 60L;
       synchronized (this) {
-        nqMinuteCloses.put(minuteSec, price);
+        chartMinuteCloses.put(minuteSec, price);
       }
-      if (inRegularSession && !nqOpen0930Locked) {
+      if (inRegularSession && !chartOpenLocked) {
         ZonedDateTime ny = Instant.ofEpochSecond(0, ts).atZone(NY_ZONE);
         if (ny.toLocalTime().isBefore(LocalTime.of(9, 31))) {
-          nqOpenLevel0930 = price;
-          nqOpen0930Locked = true;
+          chartOpen0930 = price;
+          chartOpenLocked = true;
         }
       }
     }
@@ -506,12 +525,10 @@ public class MarketRegime
     double riskPerf = calcBasketPerf(0, RISK_COUNT);
     double refPerf = calcBasketPerf(RISK_COUNT, STOCK_COUNT);
     double megaPerf = calcMegaPerf();
-    double compositePerf = calcCompositeStockPerf(riskPerf, refPerf, megaPerf);
-    double ndxPerf = calcStockPerf(ndxOpen, ndxLast);
-    ensureNqOpen0930(!Double.isNaN(ndxPerf) ? ndxPerf : compositePerf);
+    ensureChartOpen0930(calcCompositeStockPerf(riskPerf, refPerf, megaPerf));
 
-    // NDX est la référence principale du régime de marché (repli sur composite si NDX absent)
-    double chartPerf = !Double.isNaN(ndxPerf) ? ndxPerf : compositePerf;
+    // L'instrument du graphique Bookmap est la référence du régime de marché
+    double chartPerf = calcStockPerf(chartOpen0930, chartLast);
     double basketSpread =
         (!Double.isNaN(refPerf) && !Double.isNaN(riskPerf)) ? refPerf - riskPerf : Double.NaN;
 
@@ -522,13 +539,20 @@ public class MarketRegime
     updateRegimeState(chartPerf, riskPerf, refPerf, megaPerf);
 
     // 1. Tracé continu des courbes sur la Heatmap depuis 09h30 NY
-    ndxHeatmapIndicator.addPoint(projectFromOpen0930(ndxPerf));
-    riskHeatmapIndicator.addPoint(projectFromOpen0930(riskPerf));
-    refugeHeatmapIndicator.addPoint(projectFromOpen0930(refPerf));
-    megaHeatmapIndicator.addPoint(projectFromOpen0930(megaPerf));
+    if (chartNanos > 0) {
+      long minute = chartNanos / 60_000_000_000L;
+      if (settings.heatmapAutoScale && minute != lastAutoScaleMinute) {
+        lastAutoScaleMinute = minute;
+        updateAutoScales(false);
+      }
+      heatmapPerfPoints.put(chartNanos, new double[] {riskPerf, refPerf, megaPerf, chartPerf});
+    }
+    riskHeatmapIndicator.addPoint(projectFromOpen0930(0, riskPerf));
+    refugeHeatmapIndicator.addPoint(projectFromOpen0930(1, refPerf));
+    megaHeatmapIndicator.addPoint(projectFromOpen0930(2, megaPerf));
 
     // 2. Tracé des variations directes en % depuis 09h30 NY (Bottom Chart + Widgets)
-    ndxIndicator.addPoint(ndxPerf);
+    chartIndicator.addPoint(chartPerf);
     riskIndicator.addPoint(riskPerf);
     refugeIndicator.addPoint(refPerf);
     megaIndicator.addPoint(megaPerf);
@@ -545,10 +569,15 @@ public class MarketRegime
     withinIndicator.addPoint(withinCorr);
   }
 
-  private void ensureNqOpen0930(double fallbackPerf) {
-    if (!nqOpen0930Locked && !Double.isNaN(lastNqLevel) && !Double.isNaN(fallbackPerf)) {
-      nqOpenLevel0930 = lastNqLevel / (1.0 + fallbackPerf / 100.0);
-      nqOpen0930Locked = true;
+  /**
+   * Dernier recours si Bookmap n'a aucun trade de l'instrument à 09h30 NY (graphique ouvert en
+   * cours de séance sans historique) : estime son ouverture à partir du composite des paniers.
+   */
+  private void ensureChartOpen0930(double fallbackPerf) {
+    if (!chartOpenLocked && !Double.isNaN(chartLast) && !Double.isNaN(fallbackPerf)) {
+      chartOpen0930 = chartLast / (1.0 + fallbackPerf / 100.0);
+      chartOpenLocked = true;
+      chartOpenEstimated = true;
     }
   }
 
@@ -556,8 +585,8 @@ public class MarketRegime
     if (isRealtime && currentRthDate != null) {
       return currentRthDate;
     }
-    if (!nqMinuteCloses.isEmpty()) {
-      return Instant.ofEpochSecond(nqMinuteCloses.lastKey()).atZone(NY_ZONE).toLocalDate();
+    if (!chartMinuteCloses.isEmpty()) {
+      return Instant.ofEpochSecond(chartMinuteCloses.lastKey()).atZone(NY_ZONE).toLocalDate();
     }
     if (histSessionDate != null) {
       return histSessionDate;
@@ -568,27 +597,100 @@ public class MarketRegime
     return ZonedDateTime.now(NY_ZONE).toLocalDate();
   }
 
-  private double projectFromOpen0930(double perfPercent) {
+  private double projectFromOpen0930(int line, double perfPercent) {
     if (Double.isNaN(perfPercent)) {
       return Double.NaN;
     }
     double baseLevel =
-        (!Double.isNaN(nqOpenLevel0930) && nqOpenLevel0930 > 0.0) ? nqOpenLevel0930 : lastNqLevel;
+        (!Double.isNaN(chartOpen0930) && chartOpen0930 > 0.0) ? chartOpen0930 : chartLast;
     if (Double.isNaN(baseLevel) || baseLevel <= 0.0) {
       return Double.NaN;
     }
-    return baseLevel * (1.0 + (perfPercent * settings.heatmapScale) / 100.0);
+    return baseLevel * (1.0 + (perfPercent * heatmapScaleFor(line)) / 100.0);
+  }
+
+  private double heatmapScaleFor(int line) {
+    double auto = autoScales[line];
+    return (settings.heatmapAutoScale && !Double.isNaN(auto)) ? auto : settings.heatmapScale;
+  }
+
+  /**
+   * Mode Auto : l'échelle de chaque courbe de la Heatmap est le rapport entre l'écart-type des
+   * variations 1m de l'instrument du graphique et celui du panier depuis 09h30 NY, pour que chaque
+   * courbe ait l'amplitude du prix. Les courbes ne sont retracées que si une échelle bouge de plus
+   * de 5 % (ou si {@code forceRedraw}), afin de garder un tracé cohérent sans retracer chaque minute.
+   */
+  private synchronized void updateAutoScales(boolean forceRedraw) {
+    double[] next = new double[HEATMAP_LINES];
+    Arrays.fill(next, Double.NaN);
+    if (settings.heatmapAutoScale) {
+      double[] sumSqChart = new double[HEATMAP_LINES];
+      double[] sumSqLine = new double[HEATMAP_LINES];
+      int[] steps = new int[HEATMAP_LINES];
+      double[] prevRow = null;
+      double[] minuteRow = null;
+      long currentMinute = Long.MIN_VALUE;
+      // Échantillonne la dernière valeur de chaque minute, puis compare les minutes successives
+      for (Map.Entry<Long, double[]> entry : heatmapPerfPoints.entrySet()) {
+        long minute = entry.getKey() / 60_000_000_000L;
+        if (minute != currentMinute && minuteRow != null) {
+          if (prevRow != null) {
+            accumulateAutoScaleStep(prevRow, minuteRow, sumSqChart, sumSqLine, steps);
+          }
+          prevRow = minuteRow;
+        }
+        currentMinute = minute;
+        minuteRow = entry.getValue();
+      }
+      if (prevRow != null && minuteRow != null) {
+        accumulateAutoScaleStep(prevRow, minuteRow, sumSqChart, sumSqLine, steps);
+      }
+      for (int i = 0; i < HEATMAP_LINES; i++) {
+        if (steps[i] >= MIN_AUTO_SCALE_STEPS && sumSqChart[i] > 0.0 && sumSqLine[i] > 0.0) {
+          double ratio = Math.sqrt(sumSqChart[i] / sumSqLine[i]);
+          next[i] = Math.max(MIN_HEATMAP_SCALE, Math.min(MAX_HEATMAP_SCALE, ratio));
+        }
+      }
+    }
+
+    boolean changed = forceRedraw;
+    for (int i = 0; i < HEATMAP_LINES; i++) {
+      double old = autoScales[i];
+      if (Double.isNaN(old) != Double.isNaN(next[i])
+          || (!Double.isNaN(old) && Math.abs(next[i] / old - 1.0) > AUTO_SCALE_REDRAW_RATIO)) {
+        changed = true;
+      }
+    }
+    if (changed) {
+      System.arraycopy(next, 0, autoScales, 0, HEATMAP_LINES);
+      reprojectHeatmapLines();
+    }
+  }
+
+  private static void accumulateAutoScaleStep(
+      double[] prevRow, double[] row, double[] sumSqChart, double[] sumSqLine, int[] steps) {
+    double chartStep = row[PERF_CHART] - prevRow[PERF_CHART];
+    if (Double.isNaN(chartStep)) {
+      return;
+    }
+    for (int i = 0; i < HEATMAP_LINES; i++) {
+      double lineStep = row[i] - prevRow[i];
+      if (!Double.isNaN(lineStep)) {
+        sumSqChart[i] += chartStep * chartStep;
+        sumSqLine[i] += lineStep * lineStep;
+        steps[i]++;
+      }
+    }
   }
 
   private void plotNaN() {
     if (riskIndicator == null) {
       return;
     }
-    ndxHeatmapIndicator.addPoint(Double.NaN);
     riskHeatmapIndicator.addPoint(Double.NaN);
     refugeHeatmapIndicator.addPoint(Double.NaN);
     megaHeatmapIndicator.addPoint(Double.NaN);
-    ndxIndicator.addPoint(Double.NaN);
+    chartIndicator.addPoint(Double.NaN);
     riskIndicator.addPoint(Double.NaN);
     refugeIndicator.addPoint(Double.NaN);
     megaIndicator.addPoint(Double.NaN);
@@ -952,8 +1054,6 @@ public class MarketRegime
   }
 
   private synchronized void resetSessionData() {
-    ndxOpen = Double.NaN;
-    ndxLast = Double.NaN;
     Arrays.fill(stockOpen, Double.NaN);
     Arrays.fill(stockLast, Double.NaN);
     Arrays.fill(megaOpen, Double.NaN);
@@ -966,9 +1066,11 @@ public class MarketRegime
     Arrays.fill(histOpen0930, Double.NaN);
     Arrays.fill(histBarCount, 0);
     Arrays.fill(histTickerDone, false);
-    histCompletedTickers = 0;
     histCompletedStocks = 0;
     lastTwsError = "None";
+    heatmapPerfPoints.clear();
+    Arrays.fill(autoScales, Double.NaN);
+    lastAutoScaleMinute = Long.MIN_VALUE;
     completedReturnRows.clear();
     lastCorrStepEpochSec = -1;
     wasRiskBelowChart = false;
@@ -1005,10 +1107,6 @@ public class MarketRegime
         megaOpen[i] = hOpen;
       }
     }
-    double hNdxOpen = histOpen0930[SLOT_NDX];
-    if (!Double.isNaN(hNdxOpen) && hNdxOpen > 0.0) {
-      ndxOpen = hNdxOpen;
-    }
 
     long histRthStartSec =
         histSessionDate.atTime(RTH_OPEN).atZone(NY_ZONE).toInstant().getEpochSecond();
@@ -1017,24 +1115,25 @@ public class MarketRegime
         targetChartDate.atTime(RTH_OPEN).atZone(NY_ZONE).toInstant().getEpochSecond();
     long chartRthStartNanos = chartRthStartSec * 1_000_000_000L;
 
-    if (!nqOpen0930Locked) {
-      Map.Entry<Long, Double> firstNq = nqMinuteCloses.ceilingEntry(chartRthStartSec);
-      if (firstNq != null && firstNq.getKey() <= chartRthStartSec + 60L) {
-        nqOpenLevel0930 = firstNq.getValue();
-        nqOpen0930Locked = true;
+    if (!chartOpenLocked) {
+      Map.Entry<Long, Double> firstChart = chartMinuteCloses.ceilingEntry(chartRthStartSec);
+      if (firstChart != null && firstChart.getKey() < chartRthStartSec + 60L) {
+        chartOpen0930 = firstChart.getValue();
+        chartOpenLocked = true;
+        chartOpenEstimated = false;
       } else {
-        double currentNdxPerf = calcStockPerf(ndxOpen, ndxLast);
-        double currentCompPerf =
+        ensureChartOpen0930(
             calcCompositeStockPerf(
                 calcBasketPerf(0, RISK_COUNT),
                 calcBasketPerf(RISK_COUNT, STOCK_COUNT),
-                calcMegaPerf());
-        ensureNqOpen0930(!Double.isNaN(currentNdxPerf) ? currentNdxPerf : currentCompPerf);
+                calcMegaPerf()));
       }
     }
 
     // 2. Vide intégralement les indicateurs avant d'insérer par ordre chronologique strict
     clearIndicators(0L, Long.MAX_VALUE / 2);
+    heatmapPerfPoints.clear();
+    Arrays.fill(autoScales, Double.NaN);
 
     // 3. Réinitialise l'état de séance et rejoue chaque minute depuis 09h30 NY
     wasRiskBelowChart = false;
@@ -1044,7 +1143,6 @@ public class MarketRegime
     double[] runningStock = stockOpen.clone();
     double[] prevStepStock = stockOpen.clone();
     double[] runningMega = megaOpen.clone();
-    double runningNdx = ndxOpen;
     int totalWindowSec = Math.max(60, settings.corrWindowMinutes * 60);
 
     // Point d'origine à 09h30:00 NY (0.0 %)
@@ -1082,26 +1180,17 @@ public class MarketRegime
           runningMega[i] = c;
         }
       }
-      double cNdx = closes[SLOT_NDX];
-      if (!Double.isNaN(cNdx) && cNdx > 0.0) {
-        runningNdx = cNdx;
-      }
 
       double hRiskPerf = calcBasketPerfFromArray(runningStock, 0, RISK_COUNT);
       double hRefPerf = calcBasketPerfFromArray(runningStock, RISK_COUNT, STOCK_COUNT);
       double hMegaPerf = calcMegaPerfFromArray(runningMega);
-      double hCompPerf = calcCompositeStockPerf(hRiskPerf, hRefPerf, hMegaPerf);
-      double hNdxPerf = calcStockPerf(ndxOpen, runningNdx);
-      double hRefPerfForNq = !Double.isNaN(hNdxPerf) ? hNdxPerf : hCompPerf;
 
-      Map.Entry<Long, Double> nqEntry = nqMinuteCloses.floorEntry(barEndSec);
-      boolean hasNqBar = nqEntry != null && Math.abs(nqEntry.getKey() - barEndSec) <= 120L;
-      if (!nqOpen0930Locked && hasNqBar && !Double.isNaN(hRefPerfForNq)) {
-        nqOpenLevel0930 = nqEntry.getValue() / (1.0 + hRefPerfForNq / 100.0);
-        nqOpen0930Locked = true;
-      }
-
-      double hChartPerf = !Double.isNaN(hNdxPerf) ? hNdxPerf : hCompPerf;
+      // Dernier prix Bookmap de l'instrument du graphique à la clôture de cette minute
+      Map.Entry<Long, Double> chartEntry = chartMinuteCloses.floorEntry(barEndSec - 60L);
+      double hChartPerf =
+          (chartEntry != null && chartEntry.getKey() >= chartRthStartSec)
+              ? calcStockPerf(chartOpen0930, chartEntry.getValue())
+              : Double.NaN;
       double hSpread =
           (!Double.isNaN(hRefPerf) && !Double.isNaN(hRiskPerf)) ? hRefPerf - hRiskPerf : Double.NaN;
 
@@ -1124,7 +1213,7 @@ public class MarketRegime
 
       addHistoricalPointAt(
           barEndNanos,
-          hNdxPerf,
+          hChartPerf,
           hRiskPerf,
           hRefPerf,
           hMegaPerf,
@@ -1143,6 +1232,7 @@ public class MarketRegime
               : stockLast[j];
     }
     lastCorrStepEpochSec = lastBarEndSec;
+    updateAutoScales(false);
 
     Color targetRegimeColor = colorForRegime(currentRegime);
     if (!targetRegimeColor.equals(lastAppliedRegimeColor)) {
@@ -1155,11 +1245,10 @@ public class MarketRegime
     if (toNanos <= fromNanos) {
       return;
     }
-    ndxHeatmapIndicator.clear(fromNanos, toNanos);
     riskHeatmapIndicator.clear(fromNanos, toNanos);
     refugeHeatmapIndicator.clear(fromNanos, toNanos);
     megaHeatmapIndicator.clear(fromNanos, toNanos);
-    ndxIndicator.clear(fromNanos, toNanos);
+    chartIndicator.clear(fromNanos, toNanos);
     riskIndicator.clear(fromNanos, toNanos);
     refugeIndicator.clear(fromNanos, toNanos);
     megaIndicator.clear(fromNanos, toNanos);
@@ -1171,7 +1260,7 @@ public class MarketRegime
 
   private void addHistoricalPointAt(
       long timestampNanos,
-      double ndxPerf,
+      double chartPerf,
       double riskPerf,
       double refPerf,
       double megaPerf,
@@ -1179,12 +1268,12 @@ public class MarketRegime
       double crossCorr,
       double withinCorr,
       Regime regime) {
-    addPointIfValid(ndxHeatmapIndicator, timestampNanos, projectFromOpen0930(ndxPerf));
-    addPointIfValid(riskHeatmapIndicator, timestampNanos, projectFromOpen0930(riskPerf));
-    addPointIfValid(refugeHeatmapIndicator, timestampNanos, projectFromOpen0930(refPerf));
-    addPointIfValid(megaHeatmapIndicator, timestampNanos, projectFromOpen0930(megaPerf));
+    heatmapPerfPoints.put(timestampNanos, new double[] {riskPerf, refPerf, megaPerf, chartPerf});
+    addPointIfValid(riskHeatmapIndicator, timestampNanos, projectFromOpen0930(0, riskPerf));
+    addPointIfValid(refugeHeatmapIndicator, timestampNanos, projectFromOpen0930(1, refPerf));
+    addPointIfValid(megaHeatmapIndicator, timestampNanos, projectFromOpen0930(2, megaPerf));
 
-    addPointIfValid(ndxIndicator, timestampNanos, ndxPerf);
+    addPointIfValid(chartIndicator, timestampNanos, chartPerf);
     addPointIfValid(riskIndicator, timestampNanos, riskPerf);
     addPointIfValid(refugeIndicator, timestampNanos, refPerf);
     addPointIfValid(megaIndicator, timestampNanos, megaPerf);
@@ -1195,6 +1284,26 @@ public class MarketRegime
     addPointIfValid(withinIndicator, timestampNanos, withinCorr);
   }
 
+  /**
+   * Retrace uniquement les 3 courbes de la Heatmap avec l'échelle courante, à partir de tous les
+   * points déjà tracés (historique 1m et temps réel 1s), sans rejouer l'historique TWS.
+   */
+  private synchronized void reprojectHeatmapLines() {
+    if (riskHeatmapIndicator == null || heatmapPerfPoints.isEmpty()) {
+      return;
+    }
+    riskHeatmapIndicator.clear(0L, Long.MAX_VALUE / 2);
+    refugeHeatmapIndicator.clear(0L, Long.MAX_VALUE / 2);
+    megaHeatmapIndicator.clear(0L, Long.MAX_VALUE / 2);
+    for (Map.Entry<Long, double[]> entry : heatmapPerfPoints.entrySet()) {
+      long ts = entry.getKey();
+      double[] perfs = entry.getValue();
+      addPointIfValid(riskHeatmapIndicator, ts, projectFromOpen0930(0, perfs[0]));
+      addPointIfValid(refugeHeatmapIndicator, ts, projectFromOpen0930(1, perfs[1]));
+      addPointIfValid(megaHeatmapIndicator, ts, projectFromOpen0930(2, perfs[2]));
+    }
+  }
+
   private static void addPointIfValid(
       IndicatorModifiable indicator, long timestampNanos, double value) {
     if (!Double.isNaN(value)) {
@@ -1203,9 +1312,6 @@ public class MarketRegime
   }
 
   private static int slotForTickerId(int tickerId) {
-    if (tickerId == TICKER_NDX) {
-      return SLOT_NDX;
-    }
     if (tickerId >= TICKER_RISK_BASE && tickerId < TICKER_RISK_BASE + RISK_COUNT) {
       return tickerId - TICKER_RISK_BASE;
     }
@@ -1219,7 +1325,7 @@ public class MarketRegime
   }
 
   private static double[] emptySlotArray() {
-    double[] arr = new double[TOTAL_SLOTS];
+    double[] arr = new double[STOCK_SLOTS];
     Arrays.fill(arr, Double.NaN);
     return arr;
   }
@@ -1281,17 +1387,16 @@ public class MarketRegime
     if (riskIndicator == null) {
       return;
     }
-    Color ndxCol = new Color(settings.ndxLineColor);
+    Color chartCol = new Color(settings.chartLineColor);
     Color riskCol = new Color(settings.riskLineColor);
     Color refCol = new Color(settings.refugeLineColor);
     Color megaCol = new Color(settings.megaLineColor);
 
-    ndxHeatmapIndicator.setColor(ndxCol);
     riskHeatmapIndicator.setColor(riskCol);
     refugeHeatmapIndicator.setColor(refCol);
     megaHeatmapIndicator.setColor(megaCol);
 
-    ndxIndicator.setColor(ndxCol);
+    chartIndicator.setColor(chartCol);
     riskIndicator.setColor(riskCol);
     refugeIndicator.setColor(refCol);
     megaIndicator.setColor(megaCol);
@@ -1421,7 +1526,6 @@ public class MarketRegime
         return;
       }
       try {
-        cancelTickerAndHistory(TICKER_NDX);
         for (int i = 0; i < RISK_COUNT; i++) {
           cancelTickerAndHistory(TICKER_RISK_BASE + i);
         }
@@ -1451,8 +1555,8 @@ public class MarketRegime
       // Bascule automatique sur Delayed-Frozen si un flux temps réel manque, temps réel sinon
       sock.reqMarketDataType(4);
 
-      final int[] tickerIds = new int[TOTAL_SLOTS];
-      final Contract[] contracts = new Contract[TOTAL_SLOTS];
+      final int[] tickerIds = new int[STOCK_SLOTS];
+      final Contract[] contracts = new Contract[STOCK_SLOTS];
       int k = 0;
       for (int i = 0; i < RISK_COUNT; i++) {
         tickerIds[k] = TICKER_RISK_BASE + i;
@@ -1469,11 +1573,9 @@ public class MarketRegime
         contracts[k] = buildUsStockContract(settings.megaSymbols[i]);
         k++;
       }
-      tickerIds[SLOT_NDX] = TICKER_NDX;
-      contracts[SLOT_NDX] = buildNdxContract();
 
-      // 1. Streaming temps réel immédiat pour les 21 actions US + l'indice NDX
-      for (int i = 0; i < TOTAL_SLOTS; i++) {
+      // 1. Streaming temps réel immédiat pour les 21 actions US
+      for (int i = 0; i < STOCK_SLOTS; i++) {
         if (contracts[i] != null) {
           sock.reqMktData(tickerIds[i], contracts[i], "", false, false, null);
         } else {
@@ -1483,17 +1585,16 @@ public class MarketRegime
 
       updateStatus(
           "Subscribed · Loading RTH history ("
-              + histCompletedTickers
+              + histCompletedStocks
               + "/"
-              + TOTAL_SLOTS
+              + STOCK_SLOTS
               + ")...");
 
-      // 2. Requêtes historiques RTH 1m espacées de 60 ms (NDX en premier, puis les 21 actions)
+      // 2. Requêtes historiques RTH 1m espacées de 60 ms pour les 21 actions
       Thread histThread =
           new Thread(
               () -> {
-                for (int step = 0; step < TOTAL_SLOTS; step++) {
-                  int i = (step == 0) ? SLOT_NDX : (step - 1);
+                for (int i = 0; i < STOCK_SLOTS; i++) {
                   if (!active || !subscribed || subGeneration != gen || !sock.isConnected()) {
                     return;
                   }
@@ -1523,15 +1624,6 @@ public class MarketRegime
               "MarketRegime-Hist-Requester");
       histThread.setDaemon(true);
       histThread.start();
-    }
-
-    private Contract buildNdxContract() {
-      Contract c = new Contract();
-      c.symbol("NDX");
-      c.secType("IND");
-      c.exchange("NASDAQ");
-      c.currency("USD");
-      return c;
     }
 
     private Contract buildUsStockContract(String rawSymbol) {
@@ -1593,17 +1685,6 @@ public class MarketRegime
             megaLast[idx] = price;
             if (inOpeningMinute && Double.isNaN(megaOpen[idx])) {
               megaOpen[idx] = price;
-            }
-          }
-        } else if (tickerId == TICKER_NDX) {
-          if (isOpenField) {
-            if (Double.isNaN(histOpen0930[SLOT_NDX])) {
-              ndxOpen = price;
-            }
-          } else {
-            ndxLast = price;
-            if (inOpeningMinute && Double.isNaN(ndxOpen)) {
-              ndxOpen = price;
             }
           }
         }
@@ -1685,9 +1766,7 @@ public class MarketRegime
     }
 
     private void applySlotOpen(int slot, double openPrice) {
-      if (slot == SLOT_NDX) {
-        ndxOpen = openPrice;
-      } else if (slot < STOCK_COUNT) {
+      if (slot < STOCK_COUNT) {
         stockOpen[slot] = openPrice;
       } else {
         megaOpen[slot - STOCK_COUNT] = openPrice;
@@ -1695,11 +1774,7 @@ public class MarketRegime
     }
 
     private void applySlotLastIfMissing(int slot, double closePrice) {
-      if (slot == SLOT_NDX) {
-        if (Double.isNaN(ndxLast)) {
-          ndxLast = closePrice;
-        }
-      } else if (slot < STOCK_COUNT) {
+      if (slot < STOCK_COUNT) {
         if (Double.isNaN(stockLast[slot])) {
           stockLast[slot] = closePrice;
         }
@@ -1712,41 +1787,33 @@ public class MarketRegime
     }
 
     private void markHistoricalSlotDone(int slot) {
-      if (slot < 0 || slot >= TOTAL_SLOTS) {
+      if (slot < 0 || slot >= STOCK_SLOTS) {
         return;
       }
       boolean shouldRebuild = false;
       int doneCount;
-      int stockDoneCount;
       synchronized (MarketRegime.this) {
         if (!histTickerDone[slot]) {
           histTickerDone[slot] = true;
-          histCompletedTickers++;
-          if (slot < STOCK_SLOTS) {
-            histCompletedStocks++;
-          }
-          shouldRebuild =
-              (histCompletedTickers == TOTAL_SLOTS
-                  || histCompletedStocks == STOCK_SLOTS
-                  || histCompletedTickers % 5 == 0);
+          histCompletedStocks++;
+          shouldRebuild = (histCompletedStocks == STOCK_SLOTS || histCompletedStocks % 5 == 0);
         }
-        doneCount = histCompletedTickers;
-        stockDoneCount = histCompletedStocks;
+        doneCount = histCompletedStocks;
       }
       if (shouldRebuild) {
         rebuildHistoryFrom0930();
       }
       if (subscribed) {
-        if (doneCount >= TOTAL_SLOTS || stockDoneCount >= STOCK_SLOTS) {
+        if (doneCount >= STOCK_SLOTS) {
           updateStatus(
               "Subscribed ("
                   + settings.twsHost
                   + ":"
                   + settings.twsPort
-                  + ") · NDX + 21 stocks (RTH history ready)");
+                  + ") · 21 stocks (RTH history ready)");
         } else {
           updateStatus(
-              "Subscribed · Loading RTH history (" + doneCount + "/" + TOTAL_SLOTS + ")...");
+              "Subscribed · Loading RTH history (" + doneCount + "/" + STOCK_SLOTS + ")...");
         }
       }
     }
@@ -1911,7 +1978,17 @@ public class MarketRegime
     regimeParams.add(gap());
     regimeParams.add(
         pair(
-            new JLabel("Heatmap scale"),
+            new JLabel("Heatmap auto scale"),
+            checkBox(
+                settings.heatmapAutoScale,
+                v -> {
+                  settings.heatmapAutoScale = v;
+                  updateAutoScales(true);
+                })));
+    regimeParams.add(gap());
+    regimeParams.add(
+        pair(
+            new JLabel("Heatmap scale (manual)"),
             doubleSpinner(
                 settings.heatmapScale,
                 0.05,
@@ -1919,18 +1996,18 @@ public class MarketRegime
                 0.05,
                 v -> {
                   settings.heatmapScale = v;
-                  rebuildHistoryFrom0930();
+                  reprojectHeatmapLines();
                 })));
 
     // 3. Section Couleurs des Courbes
     JPanel lineColors = verticalBox();
     lineColors.add(
         colorRow(
-            new Color(settings.ndxLineColor),
-            DEFAULT_NDX_COLOR,
-            "NDX index (%)",
+            new Color(settings.chartLineColor),
+            DEFAULT_CHART_COLOR,
+            "Chart instrument (%)",
             c -> {
-              settings.ndxLineColor = c.getRGB();
+              settings.chartLineColor = c.getRGB();
               onColorEdited();
             }));
     lineColors.add(gap());
@@ -2177,8 +2254,8 @@ public class MarketRegime
     if (s.heatmapScale <= 0.0 || Double.isNaN(s.heatmapScale)) {
       s.heatmapScale = 0.25;
     }
-    if (s.ndxLineColor == 0) {
-      s.ndxLineColor = DEFAULT_NDX_COLOR.getRGB();
+    if (s.chartLineColor == 0) {
+      s.chartLineColor = DEFAULT_CHART_COLOR.getRGB();
     }
   }
 
@@ -2235,13 +2312,7 @@ public class MarketRegime
     double riskPerf = calcBasketPerf(0, RISK_COUNT);
     double refPerf = calcBasketPerf(RISK_COUNT, STOCK_COUNT);
     double megaPerf = calcMegaPerf();
-    double compPerf = calcCompositeStockPerf(riskPerf, refPerf, megaPerf);
-    double ndxPerf = calcStockPerf(ndxOpen, ndxLast);
-    double mnqPerf =
-        (nqOpen0930Locked && !Double.isNaN(lastNqLevel) && nqOpenLevel0930 > 0.0)
-            ? (lastNqLevel / nqOpenLevel0930 - 1.0) * 100.0
-            : compPerf;
-    double chartPerf = !Double.isNaN(ndxPerf) ? ndxPerf : mnqPerf;
+    double chartPerf = calcStockPerf(chartOpen0930, chartLast);
     double spread =
         (!Double.isNaN(refPerf) && !Double.isNaN(riskPerf)) ? refPerf - riskPerf : Double.NaN;
     double[] corrs = calcCorrelationsFromWindow(null);
@@ -2253,13 +2324,13 @@ public class MarketRegime
         .append(inRegularSession ? " (RTH OPEN)" : " (OUTSIDE RTH)")
         .append('\n');
     sb.append("RTH History    : ")
-        .append(histCompletedTickers)
+        .append(histCompletedStocks)
         .append('/')
-        .append(TOTAL_SLOTS)
+        .append(STOCK_SLOTS)
         .append(" instruments · ")
         .append(histMinuteCloses.size())
         .append(" TWS bars (1m) · ")
-        .append(nqMinuteCloses.size())
+        .append(chartMinuteCloses.size())
         .append(" Bookmap bars (1m)\n");
     sb.append("Active Regime  : ")
         .append(currentRegime.label)
@@ -2276,13 +2347,27 @@ public class MarketRegime
         .append(completedReturnRows.size())
         .append(" steps in ")
         .append(settings.corrWindowMinutes)
-        .append("m)\n\n");
+        .append("m)\n");
+    sb.append(
+        String.format(
+            Locale.US,
+            "Heatmap Scale  : %s · Risk x%.2f · Refuge x%.2f · Mega x%.2f%n%n",
+            settings.heatmapAutoScale ? "Auto" : "Manual",
+            heatmapScaleFor(0),
+            heatmapScaleFor(1),
+            heatmapScaleFor(2)));
 
     sb.append("SUMMARY (% since 09:30 NY)\n");
     sb.append("------------------------------------------------------------\n");
-    sb.append(String.format(Locale.US, "NDX Index    : %s%n", fmtPct(ndxPerf)));
-    sb.append(String.format(Locale.US, "Chart (MNQ)  : %s%n", fmtPct(mnqPerf)));
-    sb.append(String.format(Locale.US, "Active Bench : %s%n", fmtPct(chartPerf)));
+    sb.append(
+        String.format(
+            Locale.US,
+            "Chart        : %s (%s, 09:30 open %s)%n",
+            fmtPct(chartPerf),
+            chartAlias,
+            !chartOpenLocked
+                ? "unknown"
+                : chartOpenEstimated ? "estimated from baskets" : "from Bookmap trades"));
     sb.append(String.format(Locale.US, "Risk Basket  : %s%n", fmtPct(riskPerf)));
     sb.append(String.format(Locale.US, "Refuge Basket: %s%n", fmtPct(refPerf)));
     sb.append(String.format(Locale.US, "Mega Basket  : %s%n", fmtPct(megaPerf)));
@@ -2301,18 +2386,11 @@ public class MarketRegime
     sb.append("------------------------------------------------------------------------\n");
     appendTickerRow(
         sb,
-        "INDEX",
-        "NDX",
-        ndxOpen,
-        ndxLast,
-        histBarCount[SLOT_NDX] + "m");
-    appendTickerRow(
-        sb,
         "CHART",
-        "MNQ/NQ",
-        nqOpenLevel0930 * instrumentPips,
-        lastNqLevel * instrumentPips,
-        nqMinuteCloses.size() + "m");
+        chartAlias,
+        chartOpen0930 * instrumentPips,
+        chartLast * instrumentPips,
+        chartMinuteCloses.size() + "m");
     for (int i = 0; i < RISK_COUNT; i++) {
       appendTickerRow(
           sb,
@@ -2586,6 +2664,6 @@ public class MarketRegime
     } catch (Exception ignored) {
       // Ignoré
     }
-    return "1.0.0";
+    return "1.0.1";
   }
 }
