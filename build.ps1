@@ -1,7 +1,7 @@
 # Compile Market Regime contre l'API de l'installation Bookmap locale et TWS API locale.
-# Usage : powershell -ExecutionPolicy Bypass -File build.ps1 [-Version 1.0.1] [-User BrunoF] [-BookmapLib 'C:\Program Files\Bookmap\lib'] [-TwsApiDir 'C:\Users\superpc\tws-api\source\javaclient']
+# Usage : powershell -ExecutionPolicy Bypass -File build.ps1 [-Version 1.0.2] [-User BrunoF] [-BookmapLib 'C:\Program Files\Bookmap\lib'] [-TwsApiDir 'C:\Users\superpc\tws-api\source\javaclient']
 param(
-    [string]$Version = '1.0.1',
+    [string]$Version = '1.0.2',
     [string]$User = 'BrunoF',
     [string]$BookmapLib = 'C:\Program Files\Bookmap\lib',
     [string]$TwsApiDir = 'C:\Users\superpc\tws-api\source\javaclient'

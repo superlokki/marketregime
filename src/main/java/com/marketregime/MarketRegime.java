@@ -19,8 +19,11 @@ import java.awt.Insets;
 import java.awt.Toolkit;
 import java.awt.Window;
 import java.awt.datatransfer.StringSelection;
+import java.io.File;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Paths;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
@@ -28,11 +31,16 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 import java.util.function.DoubleConsumer;
 import java.util.function.IntConsumer;
@@ -43,6 +51,7 @@ import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JComponent;
 import javax.swing.JDialog;
+import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
@@ -53,6 +62,7 @@ import javax.swing.SpinnerNumberModel;
 import javax.swing.SwingUtilities;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
+import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.plaf.basic.BasicHTML;
 import javax.swing.text.View;
 import velox.api.layer1.annotations.Layer1ApiVersion;
@@ -114,11 +124,11 @@ public class MarketRegime
   private static final LocalTime RTH_OPEN = LocalTime.of(9, 30);
   private static final LocalTime RTH_CLOSE = LocalTime.of(16, 0);
 
-  private static final int RISK_COUNT = 9;
-  private static final int REFUGE_COUNT = 7;
-  private static final int STOCK_COUNT = RISK_COUNT + REFUGE_COUNT;
-  private static final int MEGA_COUNT = 5;
-  private static final int STOCK_SLOTS = STOCK_COUNT + MEGA_COUNT;
+  // Tailles maximales des paniers : 30 + 29 + 5 = 64 lignes TWS sur les 100 par défaut d'un compte
+  // (mêmes plafonds que Quant Research et l'indicateur TradingView)
+  static final int MAX_RISK = 30;
+  static final int MAX_REFUGE = 29;
+  static final int MAX_MEGA = 5;
   private static final int MIN_BASKET_STOCKS = 5;
   private static final int MIN_MEGA_STOCKS = 3;
   private static final int MIN_CORR_STEPS = 3;
@@ -140,11 +150,19 @@ public class MarketRegime
   private static final int TICKER_REF_BASE = 300;
   private static final int TICKER_MEGA_BASE = 400;
   private static final int HIST_REQ_OFFSET = 1000;
+  private static final int HIST_ID_RANGES = 8;
+
+  // Pacing TWS : au plus (lignes de données / 2) = 50 requêtes par seconde par défaut ; une requête
+  // toutes les 25 ms en envoie 40 par seconde
+  private static final long REQUEST_SPACING_MS = 25L;
+
+  // Historique du jour redemandé à 09h31:05 NY, une fois la première barre 1m de la séance close
+  private static final LocalTime HIST_REQUEST_AFTER_OPEN = LocalTime.of(9, 31, 5);
+  private static final int MAX_HIST_RETRIES = 3;
 
   // Tick types TWS API (com.ib.client.TickType)
   private static final int FIELD_LAST = 4;
   private static final int FIELD_OPEN = 14;
-  private static final int FIELD_LAST_RTH = 57;
   private static final int FIELD_DELAYED_LAST = 68;
   private static final int FIELD_DELAYED_OPEN = 76;
 
@@ -162,15 +180,6 @@ public class MarketRegime
   private static final Color DEFAULT_SLOW_LONG_COLOR = new Color(0x08, 0x99, 0x81);
   private static final Color DEFAULT_ROT_REFUGE_COLOR = new Color(0xFF, 0x98, 0x00);
   private static final Color DEFAULT_ROT_RISK_COLOR = new Color(0x29, 0x62, 0xFF);
-
-  private static final String[] DEFAULT_RISK_SYMBOLS = {
-    "ALAB", "ARM", "CRWV", "KLAC", "LRCX", "MRVL", "NBIS", "SNDK", "WDC"
-  };
-  private static final String[] DEFAULT_REFUGE_SYMBOLS = {
-    "ADBE", "ADP", "CTAS", "INTU", "ROP", "TRI", "WDAY"
-  };
-  private static final String[] DEFAULT_MEGA_SYMBOLS = {"NVDA", "AAPL", "MSFT", "GOOGL", "META"};
-  private static final double[] DEFAULT_MEGA_WEIGHTS = {5.34, 5.03, 3.96, 4.07, 1.81};
 
   private static final int TEXT_INDENT = 10;
   private static final String VERSION = readVersion();
@@ -206,17 +215,20 @@ public class MarketRegime
     /** Identifiant client TWS API. */
     public int twsClientId = 17;
 
-    /** Symboles des 9 actions du panier Risk. */
-    public String[] riskSymbols = DEFAULT_RISK_SYMBOLS.clone();
+    /** Symboles du panier Risk (5 à 30 actions), copiés de la dernière watchlist chargée. */
+    public String[] riskSymbols = new String[0];
 
-    /** Symboles des 7 actions du panier Refuge. */
-    public String[] refugeSymbols = DEFAULT_REFUGE_SYMBOLS.clone();
+    /** Symboles du panier Refuge (5 à 29 actions), copiés de la dernière watchlist chargée. */
+    public String[] refugeSymbols = new String[0];
 
-    /** Symboles des 5 actions du panier Mega-cap. */
-    public String[] megaSymbols = DEFAULT_MEGA_SYMBOLS.clone();
+    /** Symboles du panier Mega-cap (3 à 5 actions), copiés de la dernière watchlist chargée. */
+    public String[] megaSymbols = new String[0];
 
-    /** Poids des 5 actions du panier Mega-cap (capitalisation en T$). */
-    public double[] megaWeights = DEFAULT_MEGA_WEIGHTS.clone();
+    /** Poids des actions du panier Mega-cap (capitalisation en T$), même ordre que les symboles. */
+    public double[] megaWeights = new double[0];
+
+    /** Fichier CSV de watchlist (colonnes basket,symbol,weight), exporté par Quant Research. */
+    public String watchlistPath = "";
 
     /** Vrai si le panier Mega-cap doit confirmer les rotations. */
     public boolean confirmMega = true;
@@ -324,13 +336,25 @@ public class MarketRegime
   private volatile double chartLast = Double.NaN;
   private final TreeMap<Long, Double> chartMinuteCloses = new TreeMap<>();
 
-  // État des prix reçus de TWS (index 0..8 = Risk, 9..15 = Refuge, puis Mega)
-  private final double[] stockOpen = new double[STOCK_COUNT];
-  private final double[] stockLast = new double[STOCK_COUNT];
-  private final double[] megaOpen = new double[MEGA_COUNT];
-  private final double[] megaLast = new double[MEGA_COUNT];
+  // Paniers de l'abonnement TWS en cours, figés à chaque remise à zéro de séance à partir des
+  // réglages : Risk = slots 0..riskCount-1, Refuge = riskCount..stockCount-1, puis Mega
+  private String[] activeRiskSymbols = new String[0];
+  private String[] activeRefugeSymbols = new String[0];
+  private String[] activeMegaSymbols = new String[0];
+  private double[] activeMegaWeights = new double[0];
+  private int riskCount;
+  private int refugeCount;
+  private int stockCount;
+  private int megaCount;
+  private int slotCount;
 
-  // Historique RTH 1m depuis 09h30 NY (0..8 = Risk, 9..15 = Refuge, 16..20 = Mega)
+  // État des prix reçus de TWS (Risk puis Refuge dans stock*, Mega dans mega*)
+  private double[] stockOpen = new double[0];
+  private double[] stockLast = new double[0];
+  private double[] megaOpen = new double[0];
+  private double[] megaLast = new double[0];
+
+  // Historique RTH 1m depuis 09h30 NY, par slot (Risk, Refuge, puis Mega)
   private LocalDate histSessionDate;
   private final TreeMap<Long, double[]> histMinuteCloses = new TreeMap<>();
 
@@ -339,17 +363,27 @@ public class MarketRegime
   private final TreeMap<Long, double[]> heatmapPerfPoints = new TreeMap<>();
   private final double[] autoScales = new double[HEATMAP_LINES];
   private long lastAutoScaleMinute = Long.MIN_VALUE;
-  private final long[] histFirstBarSec = new long[STOCK_SLOTS];
-  private final long[] histLastBarSec = new long[STOCK_SLOTS];
-  private final double[] histOpen0930 = new double[STOCK_SLOTS];
-  private final int[] histBarCount = new int[STOCK_SLOTS];
-  private final boolean[] histTickerDone = new boolean[STOCK_SLOTS];
+  private long[] histFirstBarSec = new long[0];
+  private long[] histLastBarSec = new long[0];
+  private double[] histOpen0930 = new double[0];
+  private int[] histBarCount = new int[0];
+  private boolean[] histTickerDone = new boolean[0];
   private int histCompletedStocks;
   private volatile String lastTwsError = "None";
 
+  // Redemande de l'historique du jour (09h31:05 NY, puis toutes les minutes si TWS n'a pas
+  // encore la séance du jour), en secondes epoch ; -1 si rien n'est prévu
+  private volatile long nextHistRequestSec = -1;
+  private int histRetriesToday;
+
+  // Watchlist CSV : résumé du dernier chargement pour le panneau de réglages et le snapshot
+  private volatile String watchlistStatus = "No watchlist loaded (baskets from settings)";
+  private volatile JLabel watchlistStatusLabel;
+  private volatile Runnable basketFieldsRefresher;
+
   // Fenêtre glissante des rendements pour les corrélations temps réel sans délai
   private final Deque<TimedReturnRow> completedReturnRows = new ArrayDeque<>();
-  private final double[] stepStartPrices = new double[STOCK_COUNT];
+  private double[] stepStartPrices = new double[0];
   private long lastCorrStepEpochSec = -1;
 
   // État courant du régime
@@ -371,6 +405,14 @@ public class MarketRegime
     if (loaded != null) {
       sanitizeSettings(loaded);
       this.settings = loaded;
+    }
+    // La watchlist CSV est la seule source des paniers : relue au démarrage ; si le fichier est
+    // illisible, les paniers de son dernier chargement restent. Sans fichier, aucun panier.
+    if (settings.watchlistPath.isBlank()) {
+      clearBaskets(settings);
+      setWatchlistStatus("No watchlist loaded: choose a CSV file with Browse…");
+    } else {
+      loadWatchlist(false);
     }
     resetSessionData();
 
@@ -436,7 +478,7 @@ public class MarketRegime
 
   @Override
   public void stop() {
-    twsBridge.disconnect();
+    twsBridge.shutdown();
   }
 
   @Override
@@ -484,9 +526,16 @@ public class MarketRegime
           chartOpenLocked = false;
         }
       }
-      if (isRealtime && histSessionDate != null && !nyDate.equals(histSessionDate)) {
-        onNewRegularSessionOpen();
+      if (isRealtime && twsBridge.isSubscribed() && !nyDate.equals(histSessionDate)) {
+        onNewRegularSessionOpen(nyDate);
       }
+    }
+
+    // Redemande programmée de l'historique du jour (hors du verrou du module : lock TWS d'abord)
+    long requestAt = nextHistRequestSec;
+    if (isRealtime && requestAt > 0 && epochSec >= requestAt) {
+      nextHistRequestSec = -1;
+      twsBridge.resubscribeIfSubscribed();
     }
   }
 
@@ -518,12 +567,12 @@ public class MarketRegime
       plotNaN();
       return;
     }
-    if (histCompletedStocks < STOCK_SLOTS) {
+    if (histCompletedStocks < slotCount) {
       return;
     }
 
-    double riskPerf = calcBasketPerf(0, RISK_COUNT);
-    double refPerf = calcBasketPerf(RISK_COUNT, STOCK_COUNT);
+    double riskPerf = calcBasketPerf(0, riskCount);
+    double refPerf = calcBasketPerf(riskCount, stockCount);
     double megaPerf = calcMegaPerf();
     ensureChartOpen0930(calcCompositeStockPerf(riskPerf, refPerf, megaPerf));
 
@@ -755,9 +804,9 @@ public class MarketRegime
     double total = 0.0;
     double weightSum = 0.0;
     int count = 0;
-    for (int i = 0; i < MEGA_COUNT; i++) {
+    for (int i = 0; i < megaCount; i++) {
       double perf = calcStockPerf(megaOpen[i], currentMegaPrices[i]);
-      double weight = settings.megaWeights[i];
+      double weight = activeMegaWeights[i];
       if (!Double.isNaN(perf) && weight > 0.0) {
         total += perf * weight;
         weightSum += weight;
@@ -772,7 +821,7 @@ public class MarketRegime
     int stepSec = Math.max(5, settings.corrSampleSeconds);
     int totalWindowSec = Math.max(60, settings.corrWindowMinutes * 60);
 
-    for (int j = 0; j < STOCK_COUNT; j++) {
+    for (int j = 0; j < stockCount; j++) {
       if (Double.isNaN(stepStartPrices[j]) && !Double.isNaN(stockLast[j]) && stockLast[j] > 0.0) {
         stepStartPrices[j] = stockLast[j];
       }
@@ -790,7 +839,7 @@ public class MarketRegime
       if (validRow) {
         completedReturnRows.addLast(new TimedReturnRow(nowSec, currentRow.clone()));
       }
-      for (int j = 0; j < STOCK_COUNT; j++) {
+      for (int j = 0; j < stockCount; j++) {
         if (!Double.isNaN(stockLast[j]) && stockLast[j] > 0.0) {
           stepStartPrices[j] = stockLast[j];
         }
@@ -811,7 +860,7 @@ public class MarketRegime
     if (totalRows < MIN_CORR_STEPS) {
       return new double[] {Double.NaN, Double.NaN};
     }
-    double[][] matrix = new double[totalRows][STOCK_COUNT];
+    double[][] matrix = new double[totalRows][stockCount];
     int r = 0;
     for (TimedReturnRow timedRow : completedReturnRows) {
       matrix[r++] = timedRow.returns;
@@ -819,14 +868,14 @@ public class MarketRegime
     if (extraCurrentRow != null) {
       matrix[r] = extraCurrentRow;
     }
-    return calcBasketCorrelations(matrix, RISK_COUNT);
+    return calcBasketCorrelations(matrix, riskCount);
   }
 
-  private static double[] buildNormalizedReturnRow(
+  private double[] buildNormalizedReturnRow(
       double[] prevPrices, double[] currPrices, long dtSec) {
     double scale = 1.0 / Math.sqrt(Math.max(1L, dtSec));
-    double[] row = new double[STOCK_COUNT];
-    for (int j = 0; j < STOCK_COUNT; j++) {
+    double[] row = new double[stockCount];
+    for (int j = 0; j < stockCount; j++) {
       double prev = prevPrices[j];
       double curr = currPrices[j];
       if (!Double.isNaN(prev) && prev > 0.0 && !Double.isNaN(curr) && curr > 0.0) {
@@ -838,15 +887,15 @@ public class MarketRegime
     return row;
   }
 
-  private static boolean isWindowRowValid(double[] row) {
+  private boolean isWindowRowValid(double[] row) {
     int validRisk = 0;
     int validRef = 0;
-    for (int j = 0; j < RISK_COUNT; j++) {
+    for (int j = 0; j < riskCount; j++) {
       if (!Double.isNaN(row[j])) {
         validRisk++;
       }
     }
-    for (int j = RISK_COUNT; j < STOCK_COUNT; j++) {
+    for (int j = riskCount; j < stockCount; j++) {
       if (!Double.isNaN(row[j])) {
         validRef++;
       }
@@ -858,7 +907,7 @@ public class MarketRegime
    * Calcule les corrélations moyennes intra-paniers (Within) et inter-paniers (Cross) sans boucler
    * sur les paires, comme {@code calcBasketCorrelations} dans {@code market regime.pine}.
    */
-  private static double[] calcBasketCorrelations(double[][] retMatrix, int splitIndex) {
+  private double[] calcBasketCorrelations(double[][] retMatrix, int splitIndex) {
     int rowCount = retMatrix.length;
     if (rowCount < MIN_CORR_STEPS) {
       return new double[] {Double.NaN, Double.NaN};
@@ -868,7 +917,7 @@ public class MarketRegime
     int countA = 0;
     int countB = 0;
 
-    for (int j = 0; j < STOCK_COUNT; j++) {
+    for (int j = 0; j < stockCount; j++) {
       double[] col = getActiveColumn(retMatrix, j);
       if (col == null) {
         continue;
@@ -1053,19 +1102,35 @@ public class MarketRegime
     };
   }
 
+  /**
+   * Remet la séance à zéro et fige les paniers des réglages pour le prochain abonnement TWS : les
+   * tableaux de prix et d'historique sont redimensionnés à la taille de chaque panier.
+   */
   private synchronized void resetSessionData() {
-    Arrays.fill(stockOpen, Double.NaN);
-    Arrays.fill(stockLast, Double.NaN);
-    Arrays.fill(megaOpen, Double.NaN);
-    Arrays.fill(megaLast, Double.NaN);
-    Arrays.fill(stepStartPrices, Double.NaN);
+    activeRiskSymbols = settings.riskSymbols.clone();
+    activeRefugeSymbols = settings.refugeSymbols.clone();
+    activeMegaSymbols = settings.megaSymbols.clone();
+    activeMegaWeights = settings.megaWeights.clone();
+    riskCount = activeRiskSymbols.length;
+    refugeCount = activeRefugeSymbols.length;
+    stockCount = riskCount + refugeCount;
+    megaCount = activeMegaSymbols.length;
+    slotCount = stockCount + megaCount;
+
+    stockOpen = nanArray(stockCount);
+    stockLast = nanArray(stockCount);
+    megaOpen = nanArray(megaCount);
+    megaLast = nanArray(megaCount);
+    stepStartPrices = nanArray(stockCount);
     histSessionDate = null;
     histMinuteCloses.clear();
+    histFirstBarSec = new long[slotCount];
+    histLastBarSec = new long[slotCount];
     Arrays.fill(histFirstBarSec, Long.MAX_VALUE);
     Arrays.fill(histLastBarSec, Long.MIN_VALUE);
-    Arrays.fill(histOpen0930, Double.NaN);
-    Arrays.fill(histBarCount, 0);
-    Arrays.fill(histTickerDone, false);
+    histOpen0930 = nanArray(slotCount);
+    histBarCount = new int[slotCount];
+    histTickerDone = new boolean[slotCount];
     histCompletedStocks = 0;
     lastTwsError = "None";
     heatmapPerfPoints.clear();
@@ -1077,11 +1142,25 @@ public class MarketRegime
     currentRegime = Regime.NEUTRAL;
   }
 
-  private void onNewRegularSessionOpen() {
+  private static double[] nanArray(int size) {
+    double[] arr = new double[size];
+    Arrays.fill(arr, Double.NaN);
+    return arr;
+  }
+
+  /**
+   * Ouverture RTH en temps réel alors que l'abonnement TWS date d'avant 09h30 : à 09h30:00, TWS
+   * renvoie encore l'ouverture de la veille (tick Open) et un historique sans barre du jour. La
+   * séance est donc remise à zéro tout de suite, mais l'historique n'est redemandé qu'à 09h31:05,
+   * une fois la première barre 1m de la séance close.
+   */
+  private void onNewRegularSessionOpen(LocalDate sessionDate) {
     resetSessionData();
-    if (isRealtime) {
-      twsBridge.resubscribeIfSubscribed();
+    synchronized (this) {
+      histRetriesToday = 0;
     }
+    nextHistRequestSec =
+        sessionDate.atTime(HIST_REQUEST_AFTER_OPEN).atZone(NY_ZONE).toInstant().getEpochSecond();
   }
 
   /**
@@ -1095,14 +1174,14 @@ public class MarketRegime
     }
 
     // 1. Garantit que les prix d'ouverture 09h30 NY proviennent de la barre de 09h30 NY
-    for (int i = 0; i < STOCK_COUNT; i++) {
+    for (int i = 0; i < stockCount; i++) {
       double hOpen = histOpen0930[i];
       if (!Double.isNaN(hOpen) && hOpen > 0.0) {
         stockOpen[i] = hOpen;
       }
     }
-    for (int i = 0; i < MEGA_COUNT; i++) {
-      double hOpen = histOpen0930[STOCK_COUNT + i];
+    for (int i = 0; i < megaCount; i++) {
+      double hOpen = histOpen0930[stockCount + i];
       if (!Double.isNaN(hOpen) && hOpen > 0.0) {
         megaOpen[i] = hOpen;
       }
@@ -1124,8 +1203,8 @@ public class MarketRegime
       } else {
         ensureChartOpen0930(
             calcCompositeStockPerf(
-                calcBasketPerf(0, RISK_COUNT),
-                calcBasketPerf(RISK_COUNT, STOCK_COUNT),
+                calcBasketPerf(0, riskCount),
+                calcBasketPerf(riskCount, stockCount),
                 calcMegaPerf()));
       }
     }
@@ -1168,21 +1247,21 @@ public class MarketRegime
       long barEndNanos = barEndSec * 1_000_000_000L;
       double[] closes = entry.getValue();
 
-      for (int i = 0; i < STOCK_COUNT; i++) {
+      for (int i = 0; i < stockCount; i++) {
         double c = closes[i];
         if (!Double.isNaN(c) && c > 0.0) {
           runningStock[i] = c;
         }
       }
-      for (int i = 0; i < MEGA_COUNT; i++) {
-        double c = closes[STOCK_COUNT + i];
+      for (int i = 0; i < megaCount; i++) {
+        double c = closes[stockCount + i];
         if (!Double.isNaN(c) && c > 0.0) {
           runningMega[i] = c;
         }
       }
 
-      double hRiskPerf = calcBasketPerfFromArray(runningStock, 0, RISK_COUNT);
-      double hRefPerf = calcBasketPerfFromArray(runningStock, RISK_COUNT, STOCK_COUNT);
+      double hRiskPerf = calcBasketPerfFromArray(runningStock, 0, riskCount);
+      double hRefPerf = calcBasketPerfFromArray(runningStock, riskCount, stockCount);
       double hMegaPerf = calcMegaPerfFromArray(runningMega);
 
       // Dernier prix Bookmap de l'instrument du graphique à la clôture de cette minute
@@ -1195,7 +1274,7 @@ public class MarketRegime
           (!Double.isNaN(hRefPerf) && !Double.isNaN(hRiskPerf)) ? hRefPerf - hRiskPerf : Double.NaN;
 
       double[] retRow = buildNormalizedReturnRow(prevStepStock, runningStock, 60L);
-      for (int j = 0; j < STOCK_COUNT; j++) {
+      for (int j = 0; j < stockCount; j++) {
         if (!Double.isNaN(runningStock[j]) && runningStock[j] > 0.0) {
           prevStepStock[j] = runningStock[j];
         }
@@ -1225,7 +1304,7 @@ public class MarketRegime
     }
 
     // 4. Prépare la continuité temps réel à la fin de l'historique
-    for (int j = 0; j < STOCK_COUNT; j++) {
+    for (int j = 0; j < stockCount; j++) {
       stepStartPrices[j] =
           (!Double.isNaN(prevStepStock[j]) && prevStepStock[j] > 0.0)
               ? prevStepStock[j]
@@ -1311,21 +1390,21 @@ public class MarketRegime
     }
   }
 
-  private static int slotForTickerId(int tickerId) {
-    if (tickerId >= TICKER_RISK_BASE && tickerId < TICKER_RISK_BASE + RISK_COUNT) {
+  private int slotForTickerId(int tickerId) {
+    if (tickerId >= TICKER_RISK_BASE && tickerId < TICKER_RISK_BASE + riskCount) {
       return tickerId - TICKER_RISK_BASE;
     }
-    if (tickerId >= TICKER_REF_BASE && tickerId < TICKER_REF_BASE + REFUGE_COUNT) {
-      return RISK_COUNT + (tickerId - TICKER_REF_BASE);
+    if (tickerId >= TICKER_REF_BASE && tickerId < TICKER_REF_BASE + refugeCount) {
+      return riskCount + (tickerId - TICKER_REF_BASE);
     }
-    if (tickerId >= TICKER_MEGA_BASE && tickerId < TICKER_MEGA_BASE + MEGA_COUNT) {
-      return STOCK_COUNT + (tickerId - TICKER_MEGA_BASE);
+    if (tickerId >= TICKER_MEGA_BASE && tickerId < TICKER_MEGA_BASE + megaCount) {
+      return stockCount + (tickerId - TICKER_MEGA_BASE);
     }
     return -1;
   }
 
-  private static double[] emptySlotArray() {
-    double[] arr = new double[STOCK_SLOTS];
+  private double[] emptySlotArray() {
+    double[] arr = new double[slotCount];
     Arrays.fill(arr, Double.NaN);
     return arr;
   }
@@ -1420,6 +1499,19 @@ public class MarketRegime
     private volatile boolean active;
     private volatile boolean subscribed;
     private volatile int subGeneration;
+    private int[] subscribedTickerIds = new int[0];
+    private boolean[] subscribedHistPending = new boolean[0];
+    private int subscribedHistBase = HIST_REQ_OFFSET;
+    private volatile int histIdBase = HIST_REQ_OFFSET;
+
+    // File unique et espacée de toutes les requêtes envoyées à TWS (pacing IB)
+    private final ExecutorService requestQueue =
+        Executors.newSingleThreadExecutor(
+            r -> {
+              Thread t = new Thread(r, "MarketRegime-TWS-Requests");
+              t.setDaemon(true);
+              return t;
+            });
 
     boolean isSubscribed() {
       return subscribed;
@@ -1470,9 +1562,7 @@ public class MarketRegime
       if (client != null) {
         try {
           if (client.isConnected()) {
-            if (subscribed) {
-              cancelAllSubscriptions();
-            }
+            // La déconnexion coupe tous les flux : inutile d'envoyer les annulations une à une
             client.eDisconnect();
           }
         } catch (Exception ignored) {
@@ -1480,15 +1570,50 @@ public class MarketRegime
         }
       }
       subscribed = false;
+      subscribedTickerIds = new int[0];
+      subscribedHistPending = new boolean[0];
       if (signal != null) {
         signal.issueSignal();
       }
       updateStatus("Disconnected");
     }
 
+    void shutdown() {
+      disconnect();
+      requestQueue.shutdownNow();
+    }
+
+    /**
+     * Envoie une requête à TWS depuis une file unique, espacée de {@link #REQUEST_SPACING_MS}
+     * pour rester sous la limite IB de (lignes de données / 2) requêtes par seconde. Avec une
+     * génération {@code gen >= 0}, la requête est abandonnée si l'abonnement a changé entre-temps.
+     */
+    private void enqueue(EClientSocket sock, int gen, Consumer<EClientSocket> request) {
+      requestQueue.execute(
+          () -> {
+            if (!sock.isConnected() || (gen >= 0 && (!active || !subscribed || subGeneration != gen))) {
+              return;
+            }
+            try {
+              request.accept(sock);
+            } catch (Exception e) {
+              Log.warn("MarketRegime TWS request error", e);
+            }
+            try {
+              Thread.sleep(REQUEST_SPACING_MS);
+            } catch (InterruptedException ie) {
+              Thread.currentThread().interrupt();
+            }
+          });
+    }
+
     synchronized void subscribe() {
       if (client == null || !client.isConnected()) {
         updateStatus("Not connected — click Connect first");
+        return;
+      }
+      if (!hasBaskets()) {
+        updateStatus("No baskets — load a watchlist first");
         return;
       }
       if (subscribed) {
@@ -1512,37 +1637,51 @@ public class MarketRegime
           "Unsubscribed (" + settings.twsHost + ":" + settings.twsPort + ") · Ready");
     }
 
-    synchronized void resubscribeIfSubscribed() {
+    /** Relance l'abonnement sur les paniers des réglages ; faux s'il n'y a pas d'abonnement actif. */
+    synchronized boolean resubscribeIfSubscribed() {
       if (!subscribed || client == null || !client.isConnected()) {
-        return;
+        return false;
       }
       cancelAllSubscriptions();
       resetSessionData();
       subscribeAllContracts();
+      return true;
     }
 
+    /**
+     * Annule les flux de l'abonnement en cours (identifiants mémorisés à l'abonnement, même si les
+     * paniers des réglages ont changé depuis), et seulement les historiques encore en attente.
+     */
     private void cancelAllSubscriptions() {
+      final int[] ids = subscribedTickerIds;
+      final boolean[] histPending = subscribedHistPending;
+      final int histBase = subscribedHistBase;
+      subscribedTickerIds = new int[0];
+      subscribedHistPending = new boolean[0];
       if (client == null || !client.isConnected()) {
         return;
       }
-      try {
-        for (int i = 0; i < RISK_COUNT; i++) {
-          cancelTickerAndHistory(TICKER_RISK_BASE + i);
+      final EClientSocket sock = client;
+      for (int i = 0; i < ids.length; i++) {
+        final int tickerId = ids[i];
+        enqueue(sock, -1, s -> s.cancelMktData(tickerId));
+        if (i < histPending.length && histPending[i]) {
+          enqueue(sock, -1, s -> s.cancelHistoricalData(histBase + tickerId));
         }
-        for (int i = 0; i < REFUGE_COUNT; i++) {
-          cancelTickerAndHistory(TICKER_REF_BASE + i);
-        }
-        for (int i = 0; i < MEGA_COUNT; i++) {
-          cancelTickerAndHistory(TICKER_MEGA_BASE + i);
-        }
-      } catch (Exception ignored) {
-        // Ignoré si déjà déconnecté
       }
     }
 
-    private void cancelTickerAndHistory(int tickerId) {
-      client.cancelMktData(tickerId);
-      client.cancelHistoricalData(tickerId + HIST_REQ_OFFSET);
+    /**
+     * Slot d'une requête d'historique de l'abonnement en cours, ou -1. Chaque abonnement a sa
+     * propre plage d'identifiants : une réponse ou une erreur tardive d'une requête annulée (TWS
+     * répond « query cancelled ») ne peut pas être prise pour une requête du nouvel abonnement.
+     */
+    private int histSlotForReqId(int reqId) {
+      int base = histIdBase;
+      if (reqId < base || reqId >= base + HIST_REQ_OFFSET) {
+        return -1;
+      }
+      return slotForTickerId(reqId - base);
     }
 
     private void subscribeAllContracts() {
@@ -1552,34 +1691,64 @@ public class MarketRegime
       final int gen = ++subGeneration;
       final EClientSocket sock = client;
 
-      // Bascule automatique sur Delayed-Frozen si un flux temps réel manque, temps réel sinon
-      sock.reqMarketDataType(4);
-
-      final int[] tickerIds = new int[STOCK_SLOTS];
-      final Contract[] contracts = new Contract[STOCK_SLOTS];
+      final int[] tickerIds = new int[slotCount];
+      final Contract[] contracts = new Contract[slotCount];
       int k = 0;
-      for (int i = 0; i < RISK_COUNT; i++) {
+      for (int i = 0; i < riskCount; i++) {
         tickerIds[k] = TICKER_RISK_BASE + i;
-        contracts[k] = buildUsStockContract(settings.riskSymbols[i]);
+        contracts[k] = buildUsStockContract(activeRiskSymbols[i]);
         k++;
       }
-      for (int i = 0; i < REFUGE_COUNT; i++) {
+      for (int i = 0; i < refugeCount; i++) {
         tickerIds[k] = TICKER_REF_BASE + i;
-        contracts[k] = buildUsStockContract(settings.refugeSymbols[i]);
+        contracts[k] = buildUsStockContract(activeRefugeSymbols[i]);
         k++;
       }
-      for (int i = 0; i < MEGA_COUNT; i++) {
+      for (int i = 0; i < megaCount; i++) {
         tickerIds[k] = TICKER_MEGA_BASE + i;
-        contracts[k] = buildUsStockContract(settings.megaSymbols[i]);
+        contracts[k] = buildUsStockContract(activeMegaSymbols[i]);
         k++;
       }
+      subscribedTickerIds = tickerIds.clone();
+      subscribedHistPending = new boolean[slotCount];
+      final int histBase = HIST_REQ_OFFSET * (1 + gen % HIST_ID_RANGES);
+      subscribedHistBase = histBase;
+      histIdBase = histBase;
 
-      // 1. Streaming temps réel immédiat pour les 21 actions US
-      for (int i = 0; i < STOCK_SLOTS; i++) {
+      // Bascule automatique sur Delayed-Frozen si un flux temps réel manque, temps réel sinon
+      enqueue(sock, gen, s -> s.reqMarketDataType(4));
+
+      // 1. Flux temps réel de chaque action, puis 2. historique RTH 1m du jour (barres d'une
+      // minute : non soumises aux limites IB des petites barres), le tout dans la file espacée
+      for (int i = 0; i < slotCount; i++) {
         if (contracts[i] != null) {
-          sock.reqMktData(tickerIds[i], contracts[i], "", false, false, null);
+          final int tickerId = tickerIds[i];
+          final Contract contract = contracts[i];
+          enqueue(sock, gen, s -> s.reqMktData(tickerId, contract, "", false, false, null));
         } else {
           markHistoricalSlotDone(i);
+        }
+      }
+      for (int i = 0; i < slotCount; i++) {
+        if (contracts[i] != null) {
+          final int tickerId = tickerIds[i];
+          final Contract contract = contracts[i];
+          subscribedHistPending[i] = true;
+          enqueue(
+              sock,
+              gen,
+              s ->
+                  s.reqHistoricalData(
+                      histBase + tickerId,
+                      contract,
+                      "",
+                      "1 D",
+                      "1 min",
+                      "TRADES",
+                      1,
+                      2,
+                      false,
+                      null));
         }
       }
 
@@ -1587,43 +1756,8 @@ public class MarketRegime
           "Subscribed · Loading RTH history ("
               + histCompletedStocks
               + "/"
-              + STOCK_SLOTS
+              + slotCount
               + ")...");
-
-      // 2. Requêtes historiques RTH 1m espacées de 60 ms pour les 21 actions
-      Thread histThread =
-          new Thread(
-              () -> {
-                for (int i = 0; i < STOCK_SLOTS; i++) {
-                  if (!active || !subscribed || subGeneration != gen || !sock.isConnected()) {
-                    return;
-                  }
-                  if (contracts[i] != null) {
-                    try {
-                      sock.reqHistoricalData(
-                          tickerIds[i] + HIST_REQ_OFFSET,
-                          contracts[i],
-                          "",
-                          "1 D",
-                          "1 min",
-                          "TRADES",
-                          1,
-                          2,
-                          false,
-                          null);
-                      Thread.sleep(60L);
-                    } catch (InterruptedException ie) {
-                      Thread.currentThread().interrupt();
-                      return;
-                    } catch (Exception e) {
-                      markHistoricalSlotDone(i);
-                    }
-                  }
-                }
-              },
-              "MarketRegime-Hist-Requester");
-      histThread.setDaemon(true);
-      histThread.start();
     }
 
     private Contract buildUsStockContract(String rawSymbol) {
@@ -1652,8 +1786,9 @@ public class MarketRegime
         return;
       }
       boolean isOpenField = (field == FIELD_OPEN || field == FIELD_DELAYED_OPEN);
-      boolean isLastField =
-          (field == FIELD_LAST || field == FIELD_LAST_RTH || field == FIELD_DELAYED_LAST);
+      // Le tick Open renvoie à la veille tant que l'ouverture officielle n'est pas publiée : la
+      // séance du jour est réinitialisée à 09h30 et son historique ne sert qu'après 09h31:05
+      boolean isLastField = (field == FIELD_LAST || field == FIELD_DELAYED_LAST);
       if (!isOpenField && !isLastField) {
         return;
       }
@@ -1668,15 +1803,15 @@ public class MarketRegime
       boolean inOpeningMinute = afterRthOpen && nyTime.isBefore(LocalTime.of(9, 31));
 
       synchronized (MarketRegime.this) {
-        if (tickerId >= TICKER_RISK_BASE && tickerId < TICKER_RISK_BASE + RISK_COUNT) {
+        if (tickerId >= TICKER_RISK_BASE && tickerId < TICKER_RISK_BASE + riskCount) {
           int idx = tickerId - TICKER_RISK_BASE;
           updateStockSlot(idx, idx, isOpenField, inOpeningMinute, price);
-        } else if (tickerId >= TICKER_REF_BASE && tickerId < TICKER_REF_BASE + REFUGE_COUNT) {
-          int idx = RISK_COUNT + (tickerId - TICKER_REF_BASE);
+        } else if (tickerId >= TICKER_REF_BASE && tickerId < TICKER_REF_BASE + refugeCount) {
+          int idx = riskCount + (tickerId - TICKER_REF_BASE);
           updateStockSlot(idx, idx, isOpenField, inOpeningMinute, price);
-        } else if (tickerId >= TICKER_MEGA_BASE && tickerId < TICKER_MEGA_BASE + MEGA_COUNT) {
+        } else if (tickerId >= TICKER_MEGA_BASE && tickerId < TICKER_MEGA_BASE + megaCount) {
           int idx = tickerId - TICKER_MEGA_BASE;
-          int histSlot = STOCK_COUNT + idx;
+          int histSlot = stockCount + idx;
           if (isOpenField) {
             if (Double.isNaN(histOpen0930[histSlot])) {
               megaOpen[idx] = price;
@@ -1711,7 +1846,7 @@ public class MarketRegime
 
     @Override
     public void historicalData(int reqId, Bar bar) {
-      int slot = slotForTickerId(reqId - HIST_REQ_OFFSET);
+      int slot = histSlotForReqId(reqId);
       if (slot < 0 || bar == null || bar.open() <= 0.0 || bar.close() <= 0.0) {
         return;
       }
@@ -1727,6 +1862,12 @@ public class MarketRegime
       }
 
       synchronized (MarketRegime.this) {
+        // En temps réel, seule la séance du graphique compte : à l'ouverture, TWS peut encore
+        // renvoyer la séance de la veille, qui ne doit jamais servir d'ouverture 09h30
+        LocalDate rthDate = currentRthDate;
+        if (isRealtime && rthDate != null && !barDate.equals(rthDate)) {
+          return;
+        }
         if (histSessionDate == null || barDate.isAfter(histSessionDate)) {
           histSessionDate = barDate;
           histMinuteCloses.clear();
@@ -1759,27 +1900,27 @@ public class MarketRegime
 
     @Override
     public void historicalDataEnd(int reqId, String start, String end) {
-      int slot = slotForTickerId(reqId - HIST_REQ_OFFSET);
+      int slot = histSlotForReqId(reqId);
       if (slot >= 0) {
         markHistoricalSlotDone(slot);
       }
     }
 
     private void applySlotOpen(int slot, double openPrice) {
-      if (slot < STOCK_COUNT) {
+      if (slot < stockCount) {
         stockOpen[slot] = openPrice;
       } else {
-        megaOpen[slot - STOCK_COUNT] = openPrice;
+        megaOpen[slot - stockCount] = openPrice;
       }
     }
 
     private void applySlotLastIfMissing(int slot, double closePrice) {
-      if (slot < STOCK_COUNT) {
+      if (slot < stockCount) {
         if (Double.isNaN(stockLast[slot])) {
           stockLast[slot] = closePrice;
         }
       } else {
-        int idx = slot - STOCK_COUNT;
+        int idx = slot - stockCount;
         if (Double.isNaN(megaLast[idx])) {
           megaLast[idx] = closePrice;
         }
@@ -1787,33 +1928,58 @@ public class MarketRegime
     }
 
     private void markHistoricalSlotDone(int slot) {
-      if (slot < 0 || slot >= STOCK_SLOTS) {
+      if (slot < 0 || slot >= slotCount) {
         return;
       }
+      boolean[] histPending = subscribedHistPending;
+      if (slot < histPending.length) {
+        histPending[slot] = false;
+      }
       boolean shouldRebuild = false;
+      boolean missingToday = false;
       int doneCount;
+      int totalSlots;
       synchronized (MarketRegime.this) {
         if (!histTickerDone[slot]) {
           histTickerDone[slot] = true;
           histCompletedStocks++;
-          shouldRebuild = (histCompletedStocks == STOCK_SLOTS || histCompletedStocks % 5 == 0);
+          shouldRebuild = (histCompletedStocks == slotCount || histCompletedStocks % 5 == 0);
+          // Historique complet mais sans la séance du jour (abonnement dans la 1re minute, TWS
+          // en retard) : nouvelle demande une minute plus tard, au plus 3 fois par séance
+          if (histCompletedStocks == slotCount
+              && isRealtime
+              && inRegularSession
+              && currentRthDate != null
+              && !currentRthDate.equals(histSessionDate)
+              && histRetriesToday < MAX_HIST_RETRIES) {
+            histRetriesToday++;
+            missingToday = true;
+          }
         }
         doneCount = histCompletedStocks;
+        totalSlots = slotCount;
+      }
+      if (missingToday) {
+        long nowSec = chartNanos > 0 ? chartNanos / 1_000_000_000L : Instant.now().getEpochSecond();
+        nextHistRequestSec = nowSec + 60L;
       }
       if (shouldRebuild) {
         rebuildHistoryFrom0930();
       }
       if (subscribed) {
-        if (doneCount >= STOCK_SLOTS) {
+        if (doneCount >= totalSlots) {
           updateStatus(
               "Subscribed ("
                   + settings.twsHost
                   + ":"
                   + settings.twsPort
-                  + ") · 21 stocks (RTH history ready)");
+                  + ") · "
+                  + totalSlots
+                  + " stocks (RTH history "
+                  + (missingToday ? "of today not ready yet, retry in 1 min)" : "ready)"));
         } else {
           updateStatus(
-              "Subscribed · Loading RTH history (" + doneCount + "/" + STOCK_SLOTS + ")...");
+              "Subscribed · Loading RTH history (" + doneCount + "/" + slotCount + ")...");
         }
       }
     }
@@ -1841,7 +2007,7 @@ public class MarketRegime
         return;
       }
       lastTwsError = "[" + id + "] (" + errorCode + ") " + errorMsg;
-      int histSlot = slotForTickerId(id - HIST_REQ_OFFSET);
+      int histSlot = histSlotForReqId(id);
       if (histSlot >= 0) {
         markHistoricalSlotDone(histSlot);
       }
@@ -1859,12 +2025,7 @@ public class MarketRegime
 
   /** Nettoie un symbole saisi par l'utilisateur (ex. "NASDAQ:NVDA" -> "NVDA"). */
   private static String cleanSymbol(String raw) {
-    if (raw == null) {
-      return "";
-    }
-    String trimmed = raw.trim().toUpperCase();
-    int colon = trimmed.indexOf(':');
-    return colon >= 0 ? trimmed.substring(colon + 1).trim() : trimmed;
+    return Watchlist.cleanSymbol(raw);
   }
 
   // ======================================================================
@@ -2123,85 +2284,68 @@ public class MarketRegime
               onColorEdited();
             }));
 
-    // 5. Section Risk Basket (9 actions)
-    JPanel riskBasketPanel = verticalBox();
-    for (int i = 0; i < RISK_COUNT; i++) {
-      final int idx = i;
-      if (i > 0) {
-        riskBasketPanel.add(gap());
-      }
-      riskBasketPanel.add(
-          pair(
-              new JLabel("Risk " + (i + 1)),
-              textField(
-                  settings.riskSymbols[idx], 10, v -> settings.riskSymbols[idx] = cleanSymbol(v))));
-    }
-    riskBasketPanel.add(gap());
-    JButton applyRiskBtn = new JButton("Apply Risk basket");
-    applyRiskBtn.addActionListener(
+    // 5. Section Watchlist CSV (exportée par Quant Research)
+    JPanel watchlistPanel = verticalBox();
+    FittingLabel watchlistStatusText = new FittingLabel(watchlistStatus, false);
+    this.watchlistStatusLabel = watchlistStatusText;
+    watchlistPanel.add(watchlistStatusText);
+    watchlistPanel.add(gap());
+    JTextField watchlistField =
+        textField(settings.watchlistPath, 16, v -> settings.watchlistPath = v.trim());
+    watchlistPanel.add(pair(new JLabel("File"), watchlistField));
+    watchlistPanel.add(gap());
+    JButton browseBtn = new JButton("Browse…");
+    browseBtn.addActionListener(
         e -> {
-          saveSettings();
-          twsBridge.resubscribeIfSubscribed();
+          JFileChooser chooser = new JFileChooser();
+          chooser.setFileFilter(new FileNameExtensionFilter("CSV watchlist", "csv", "txt"));
+          if (!settings.watchlistPath.isBlank()) {
+            chooser.setSelectedFile(new File(settings.watchlistPath));
+          }
+          if (chooser.showOpenDialog(browseBtn) == JFileChooser.APPROVE_OPTION) {
+            watchlistField.setText(chooser.getSelectedFile().getAbsolutePath());
+            loadWatchlist(true);
+          }
         });
-    riskBasketPanel.add(pair(new JLabel(""), applyRiskBtn));
+    JButton loadBtn = new JButton("Load watchlist");
+    loadBtn.addActionListener(e -> loadWatchlist(true));
+    JPanel watchlistButtons = new JPanel(new GridBagLayout());
+    watchlistButtons.setOpaque(false);
+    GridBagConstraints wlGc = new GridBagConstraints();
+    wlGc.gridx = 0;
+    wlGc.gridy = 0;
+    wlGc.insets = new Insets(0, 0, 0, 6);
+    watchlistButtons.add(browseBtn, wlGc);
+    wlGc = new GridBagConstraints();
+    wlGc.gridx = 1;
+    wlGc.gridy = 0;
+    watchlistButtons.add(loadBtn, wlGc);
+    watchlistPanel.add(pair(new JLabel(""), watchlistButtons));
 
-    // 6. Section Refuge Basket (7 actions)
-    JPanel refugeBasketPanel = verticalBox();
-    for (int i = 0; i < REFUGE_COUNT; i++) {
-      final int idx = i;
-      if (i > 0) {
-        refugeBasketPanel.add(gap());
-      }
-      refugeBasketPanel.add(
-          pair(
-              new JLabel("Refuge " + (i + 1)),
-              textField(
-                  settings.refugeSymbols[idx],
-                  10,
-                  v -> settings.refugeSymbols[idx] = cleanSymbol(v))));
-    }
-    refugeBasketPanel.add(gap());
-    JButton applyRefugeBtn = new JButton("Apply Refuge basket");
-    applyRefugeBtn.addActionListener(
-        e -> {
-          saveSettings();
-          twsBridge.resubscribeIfSubscribed();
-        });
-    refugeBasketPanel.add(pair(new JLabel(""), applyRefugeBtn));
-
-    // 7. Section Mega-cap Basket (5 actions + poids)
-    JPanel megaBasketPanel = verticalBox();
-    for (int i = 0; i < MEGA_COUNT; i++) {
-      final int idx = i;
-      if (i > 0) {
-        megaBasketPanel.add(gap());
-      }
-      JPanel inlineControls = new JPanel(new GridBagLayout());
-      inlineControls.setOpaque(false);
-      GridBagConstraints gc = new GridBagConstraints();
-      gc.gridx = 0;
-      gc.gridy = 0;
-      gc.insets = new Insets(0, 0, 0, 6);
-      inlineControls.add(
-          textField(settings.megaSymbols[idx], 5, v -> settings.megaSymbols[idx] = cleanSymbol(v)),
-          gc);
-      gc = new GridBagConstraints();
-      gc.gridx = 1;
-      gc.gridy = 0;
-      inlineControls.add(
-          doubleSpinner(
-              settings.megaWeights[idx], 0.0, 50.0, 0.01, v -> settings.megaWeights[idx] = v),
-          gc);
-      megaBasketPanel.add(pair(new JLabel("Mega " + (i + 1) + " (sym / weight)"), inlineControls));
-    }
-    megaBasketPanel.add(gap());
-    JButton applyMegaBtn = new JButton("Apply Mega-cap basket");
-    applyMegaBtn.addActionListener(
-        e -> {
-          saveSettings();
-          twsBridge.resubscribeIfSubscribed();
-        });
-    megaBasketPanel.add(pair(new JLabel(""), applyMegaBtn));
+    // Paniers chargés (lecture seule) : la watchlist CSV est la seule source des paniers
+    watchlistPanel.add(gap());
+    FittingLabel basketsView = new FittingLabel("", false);
+    Runnable refreshBaskets =
+        () ->
+            basketsView.setText(
+                !hasBaskets()
+                    ? "<html><i>No baskets loaded.</i></html>"
+                    : "<html><b>Risk ("
+                    + settings.riskSymbols.length
+                    + ")</b> "
+                    + String.join(", ", settings.riskSymbols)
+                    + "<br><b>Refuge ("
+                    + settings.refugeSymbols.length
+                    + ")</b> "
+                    + String.join(", ", settings.refugeSymbols)
+                    + "<br><b>Mega-cap ("
+                    + settings.megaSymbols.length
+                    + ")</b> "
+                    + formatMegaBasket(settings.megaSymbols, settings.megaWeights)
+                    + "</html>");
+    refreshBaskets.run();
+    this.basketFieldsRefresher = refreshBaskets;
+    watchlistPanel.add(basketsView);
 
     JPanel about = verticalBox();
     about.add(new FittingLabel("Market Regime " + VERSION, false));
@@ -2211,11 +2355,20 @@ public class MarketRegime
       section("Regime & Correlations", regimeParams, 6, TEXT_INDENT),
       section("Line Colors", lineColors, 4, 0),
       section("Regime Colors", regimeColors, 4, 0),
-      section("Risk Basket (9 stocks)", riskBasketPanel, 6, TEXT_INDENT),
-      section("Refuge Basket (7 stocks)", refugeBasketPanel, 6, TEXT_INDENT),
-      section("Mega-cap Basket (5 stocks)", megaBasketPanel, 6, TEXT_INDENT),
+      section("Baskets (watchlist CSV)", watchlistPanel, 6, TEXT_INDENT),
       section("About", about, 4, TEXT_INDENT)
     };
+  }
+
+  private static String formatMegaBasket(String[] symbols, double[] weights) {
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < symbols.length; i++) {
+      if (i > 0) {
+        sb.append(", ");
+      }
+      sb.append(symbols[i]).append(" (").append(String.format(Locale.US, "%.2f", weights[i])).append(')');
+    }
+    return sb.toString();
   }
 
   private void onColorEdited() {
@@ -2233,17 +2386,23 @@ public class MarketRegime
     if (s.twsHost == null || s.twsHost.isBlank()) {
       s.twsHost = "127.0.0.1";
     }
-    if (s.riskSymbols == null || s.riskSymbols.length != RISK_COUNT) {
-      s.riskSymbols = DEFAULT_RISK_SYMBOLS.clone();
+    // Les paniers ne viennent que d'une watchlist : les trois sont valides ensemble, sinon aucun
+    String[] risk = sanitizeBasket(s.riskSymbols, MAX_RISK, MIN_BASKET_STOCKS);
+    String[] refuge = sanitizeBasket(s.refugeSymbols, MAX_REFUGE, MIN_BASKET_STOCKS);
+    String[] mega = sanitizeBasket(s.megaSymbols, MAX_MEGA, MIN_MEGA_STOCKS);
+    boolean weightsValid =
+        s.megaWeights != null
+            && s.megaWeights.length == mega.length
+            && Arrays.stream(s.megaWeights).allMatch(w -> w > 0.0);
+    if (risk.length == 0 || refuge.length == 0 || mega.length == 0 || !weightsValid) {
+      clearBaskets(s);
+    } else {
+      s.riskSymbols = risk;
+      s.refugeSymbols = refuge;
+      s.megaSymbols = mega;
     }
-    if (s.refugeSymbols == null || s.refugeSymbols.length != REFUGE_COUNT) {
-      s.refugeSymbols = DEFAULT_REFUGE_SYMBOLS.clone();
-    }
-    if (s.megaSymbols == null || s.megaSymbols.length != MEGA_COUNT) {
-      s.megaSymbols = DEFAULT_MEGA_SYMBOLS.clone();
-    }
-    if (s.megaWeights == null || s.megaWeights.length != MEGA_COUNT) {
-      s.megaWeights = DEFAULT_MEGA_WEIGHTS.clone();
+    if (s.watchlistPath == null) {
+      s.watchlistPath = "";
     }
     if (s.corrWindowMinutes < 1) {
       s.corrWindowMinutes = 20;
@@ -2256,6 +2415,108 @@ public class MarketRegime
     }
     if (s.chartLineColor == 0) {
       s.chartLineColor = DEFAULT_CHART_COLOR.getRGB();
+    }
+  }
+
+  /**
+   * Symboles nettoyés, sans doublon et plafonnés à {@code max} ; un panier vide s'il en reste moins
+   * de {@code min}.
+   */
+  private static String[] sanitizeBasket(String[] symbols, int max, int min) {
+    if (symbols == null) {
+      return new String[0];
+    }
+    LinkedHashSet<String> clean = new LinkedHashSet<>();
+    for (String raw : symbols) {
+      String sym = cleanSymbol(raw);
+      if (!sym.isEmpty() && clean.size() < max) {
+        clean.add(sym);
+      }
+    }
+    return clean.size() < min ? new String[0] : clean.toArray(new String[0]);
+  }
+
+  private static void clearBaskets(Settings s) {
+    s.riskSymbols = new String[0];
+    s.refugeSymbols = new String[0];
+    s.megaSymbols = new String[0];
+    s.megaWeights = new double[0];
+  }
+
+  private boolean hasBaskets() {
+    return settings.riskSymbols.length > 0
+        && settings.refugeSymbols.length > 0
+        && settings.megaSymbols.length > 0;
+  }
+
+  /**
+   * Charge la watchlist CSV des réglages dans les paniers. En cas d'erreur, les paniers actuels
+   * restent en place et le statut l'indique. Avec {@code applyNow}, l'abonnement TWS en cours est
+   * relancé sur les nouveaux paniers.
+   */
+  private void loadWatchlist(boolean applyNow) {
+    String pathText = settings.watchlistPath == null ? "" : settings.watchlistPath.trim();
+    if (pathText.isEmpty()) {
+      setWatchlistStatus("No watchlist file: choose a CSV file with Browse…");
+      return;
+    }
+    Watchlist list;
+    try {
+      list = Watchlist.read(Paths.get(pathText), MAX_RISK, MAX_REFUGE, MAX_MEGA);
+    } catch (Watchlist.WatchlistException | InvalidPathException e) {
+      setWatchlistStatus(
+          (hasBaskets() ? "Not loaded, last loaded baskets kept: " : "Not loaded: ")
+              + e.getMessage());
+      Log.info("MarketRegime watchlist: " + e.getMessage());
+      return;
+    }
+    settings.riskSymbols = list.riskSymbols;
+    settings.refugeSymbols = list.refugeSymbols;
+    settings.megaSymbols = list.megaSymbols;
+    settings.megaWeights = list.megaWeights;
+    saveSettings();
+
+    // Paniers actifs tout de suite : abonnement TWS relancé s'il tourne, sinon les nouveaux
+    // paniers sont figés pour le prochain Subscribe (et visibles dans le Data Snapshot)
+    String applied;
+    if (applyNow && twsBridge.resubscribeIfSubscribed()) {
+      applied = "applied, TWS subscription restarted";
+    } else {
+      resetSessionData();
+      applied = "applied, used at next Subscribe";
+    }
+
+    String loadedAt =
+        ZonedDateTime.now(NY_ZONE).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm 'NY'"));
+    StringBuilder status =
+        new StringBuilder()
+            .append("Loaded ")
+            .append(loadedAt)
+            .append(" · ")
+            .append(list.riskSymbols.length)
+            .append(" Risk · ")
+            .append(list.refugeSymbols.length)
+            .append(" Refuge · ")
+            .append(settings.megaSymbols.length)
+            .append(" Mega")
+            .append(" · ")
+            .append(applied);
+    if (!list.warnings.isEmpty()) {
+      status.append(" · ").append(String.join(" · ", list.warnings));
+    }
+    setWatchlistStatus(status.toString());
+
+    Runnable refresher = basketFieldsRefresher;
+    if (refresher != null) {
+      SwingUtilities.invokeLater(refresher);
+    }
+  }
+
+  private void setWatchlistStatus(String status) {
+    this.watchlistStatus = status;
+    JLabel label = this.watchlistStatusLabel;
+    if (label != null) {
+      SwingUtilities.invokeLater(() -> label.setText("<html>" + status + "</html>"));
     }
   }
 
@@ -2309,8 +2570,8 @@ public class MarketRegime
             : ZonedDateTime.now(NY_ZONE);
     String timeStr = nyNow.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z"));
 
-    double riskPerf = calcBasketPerf(0, RISK_COUNT);
-    double refPerf = calcBasketPerf(RISK_COUNT, STOCK_COUNT);
+    double riskPerf = calcBasketPerf(0, riskCount);
+    double refPerf = calcBasketPerf(riskCount, stockCount);
     double megaPerf = calcMegaPerf();
     double chartPerf = calcStockPerf(chartOpen0930, chartLast);
     double spread =
@@ -2326,7 +2587,7 @@ public class MarketRegime
     sb.append("RTH History    : ")
         .append(histCompletedStocks)
         .append('/')
-        .append(STOCK_SLOTS)
+        .append(slotCount)
         .append(" instruments · ")
         .append(histMinuteCloses.size())
         .append(" TWS bars (1m) · ")
@@ -2351,11 +2612,21 @@ public class MarketRegime
     sb.append(
         String.format(
             Locale.US,
-            "Heatmap Scale  : %s · Risk x%.2f · Refuge x%.2f · Mega x%.2f%n%n",
+            "Heatmap Scale  : %s · Risk x%.2f · Refuge x%.2f · Mega x%.2f%n",
             settings.heatmapAutoScale ? "Auto" : "Manual",
             heatmapScaleFor(0),
             heatmapScaleFor(1),
             heatmapScaleFor(2)));
+    sb.append("Baskets        : ")
+        .append(riskCount)
+        .append(" Risk · ")
+        .append(refugeCount)
+        .append(" Refuge · ")
+        .append(megaCount)
+        .append(" Mega (")
+        .append(slotCount)
+        .append(" TWS lines)\n");
+    sb.append("Watchlist      : ").append(watchlistStatus).append("\n\n");
 
     sb.append("SUMMARY (% since 09:30 NY)\n");
     sb.append("------------------------------------------------------------\n");
@@ -2391,31 +2662,31 @@ public class MarketRegime
         chartOpen0930 * instrumentPips,
         chartLast * instrumentPips,
         chartMinuteCloses.size() + "m");
-    for (int i = 0; i < RISK_COUNT; i++) {
+    for (int i = 0; i < riskCount; i++) {
       appendTickerRow(
           sb,
           "RISK " + (i + 1),
-          settings.riskSymbols[i],
+          activeRiskSymbols[i],
           stockOpen[i],
           stockLast[i],
           histBarCount[i] + "m");
     }
-    for (int i = 0; i < REFUGE_COUNT; i++) {
-      int slot = RISK_COUNT + i;
+    for (int i = 0; i < refugeCount; i++) {
+      int slot = riskCount + i;
       appendTickerRow(
           sb,
           "REFUGE " + (i + 1),
-          settings.refugeSymbols[i],
+          activeRefugeSymbols[i],
           stockOpen[slot],
           stockLast[slot],
           histBarCount[slot] + "m");
     }
-    for (int i = 0; i < MEGA_COUNT; i++) {
-      int histSlot = STOCK_COUNT + i;
+    for (int i = 0; i < megaCount; i++) {
+      int histSlot = stockCount + i;
       String extra =
-          String.format(Locale.US, "w=%.2f %dm", settings.megaWeights[i], histBarCount[histSlot]);
+          String.format(Locale.US, "w=%.2f %dm", activeMegaWeights[i], histBarCount[histSlot]);
       appendTickerRow(
-          sb, "MEGA " + (i + 1), settings.megaSymbols[i], megaOpen[i], megaLast[i], extra);
+          sb, "MEGA " + (i + 1), activeMegaSymbols[i], megaOpen[i], megaLast[i], extra);
     }
     return sb.toString();
   }
@@ -2664,6 +2935,6 @@ public class MarketRegime
     } catch (Exception ignored) {
       // Ignoré
     }
-    return "1.0.1";
+    return "1.0.2";
   }
 }
